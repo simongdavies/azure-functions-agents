@@ -115,7 +115,7 @@ def resolve_env_var(value: str) -> str:
 
       - ``trigger.*`` (all string values except ``type``)
       - ``tools_from_connections[].connection_id``
-      - ``execution_sandbox.session_pool_management_endpoint``
+      - ``execution_sandbox.allowed_domains[].url``
 
     Fields that should **not** use substitution (identifiers, literals,
     or user-facing text): ``name``, ``description``, ``trigger.type``,

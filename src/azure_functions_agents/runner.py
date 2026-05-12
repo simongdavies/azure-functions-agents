@@ -62,7 +62,7 @@ def _load_agents_md_content() -> str:
 # Cache main.agent.md content at module load time (won't change during runtime)
 _AGENTS_MD_CONTENT_CACHE = _load_agents_md_content()
 
-DEFAULT_MODEL = os.environ.get("COPILOT_MODEL", "claude-sonnet-4")
+DEFAULT_MODEL = os.environ.get("COPILOT_MODEL", "claude-opus-4.6")
 
 # Built-in CLI tools to disable for security.
 # These are blocked regardless of whether MCP servers are configured.

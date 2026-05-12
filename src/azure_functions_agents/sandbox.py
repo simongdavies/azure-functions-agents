@@ -1,13 +1,19 @@
 """
-ACA Dynamic Sessions sandbox — execute_python tool.
+Hyperlight Wasm sandbox — execute_python tool.
 
-Provides an ``execute_python`` Copilot SDK tool backed by Azure Container Apps
-dynamic sessions (code-interpreter pools).  Configured via the
-``execution_sandbox`` block in agent frontmatter.
+Provides an ``execute_python`` Copilot SDK tool backed by Hyperlight's
+in-process Wasm sandbox.  Configured via the ``execution_sandbox`` block
+in agent frontmatter.
 
-Each agent can have its own session pool endpoint.  Within a conversation,
-the ACA session ID is derived from the Copilot session ID so that state
-(variables, imports, files, browser pages) persists across calls.
+Each agent can have its own sandbox configuration (allowed domains, memory
+limits).  Within a conversation, sandbox state (variables, imports) persists
+across calls — the same ``Sandbox`` instance is reused for a given Copilot
+session ID.
+
+Network access is deny-by-default.  Domains must be explicitly allowlisted
+in the agent frontmatter via ``allowed_domains``.  Inside the sandbox,
+guest code uses ``http_get(url)`` and ``http_post(url, body)`` built-in
+globals for outbound HTTP — no import required.
 """
 
 from __future__ import annotations
@@ -16,52 +22,22 @@ import asyncio
 import json
 import logging
 import re
-import urllib.parse
+import threading
 from typing import Any, Dict, List, Optional
 
-import aiohttp
-from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
 from copilot.tools import Tool, ToolInvocation, ToolResult
+from hyperlight_sandbox import Sandbox
 
 from .config import resolve_env_var
 
-_API_VERSION = "2025-10-02-preview"
-
 # ---------------------------------------------------------------------------
-# Playwright helper that is pre-loaded into every sandbox session
-# ---------------------------------------------------------------------------
-
-_ACA_SESSION_SETUP = """
-async def launch_browser(width=1280, height=800):
-    from playwright.async_api import async_playwright
-    p = await async_playwright().start()
-    browser = await p.chromium.launch(
-        headless=True,
-        args=[
-            f'--window-size={width},{height}',
-            '--disable-blink-features=AutomationControlled',
-            '--disable-extensions',
-        ],
-    )
-    context = await browser.new_context(
-        user_agent=(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/131.0.0.0 Safari/537.36'
-        ),
-        viewport={'width': width, 'height': height},
-    )
-    page = await context.new_page()
-    return page
-"""
-
-# ---------------------------------------------------------------------------
-# Tool description (ported from reference main.py)
+# Tool description
 # ---------------------------------------------------------------------------
 
 _EXECUTE_PYTHON_DESCRIPTION = (
-    "Execute Python code in a persistent sandboxed REPL backed by a"
-    " Jupyter kernel. Returns JSON with result, stdout, and stderr.\n"
+    "Execute Python code in a persistent sandboxed environment backed by"
+    " a Hyperlight Wasm sandbox. Returns JSON with stdout, stderr, and"
+    " exit_code.\n"
     "\n"
     "IMPORTANT: This runs in an ISOLATED SANDBOX with its own file system."
     " DO NOT use it to read or process files from the local system,"
@@ -69,56 +45,34 @@ _EXECUTE_PYTHON_DESCRIPTION = (
     " or jq tools instead.\n"
     "\n"
     "Only use this tool when you need to actually run code,"
-    " when no other tool can accomplish the task (there's a small cost to using it) —"
-    " computation, data processing, web browsing, etc."
+    " when no other tool can accomplish the task (there's a small cost to"
+    " using it) — computation, data processing, fetching web data, etc."
     " Do NOT call this tool just to print text, format output, or display"
     " results you already have. Respond directly with text instead.\n"
     "\n"
     "Key behaviors:\n"
     "- State persists across calls: variables, imports, and files"
-    " (/mnt/data/) are retained between invocations.\n"
-    "- The last expression value is returned in 'result' (like a"
-    " Jupyter cell). Use print() for explicit output to 'stdout'.\n"
-    "- Top-level await is supported (Jupyter kernel).\n"
-    "- Playwright is pre-installed for browser automation (see `launch_browser` helper below).\n"
-    "- Shell commands: use subprocess.run(), not '!' syntax.\n"
-    "- Common packages are pre-installed: requests, numpy, pandas, matplotlib,"
-    " scikit-learn, playwright, etc.\n"
+    " are retained between invocations within the same conversation.\n"
+    "- Use print() for ALL output — there is no implicit last-expression"
+    " return like Jupyter. Output appears in 'stdout'.\n"
+    "- Common modules are available: math, json, re, datetime,"
+    " collections, itertools, functools, etc.\n"
     "\n"
-    "Returning binary data (images, screenshots):\n"
-    "- Generate the data, base64-encode it, and print it to stdout.\n"
-    "- Example for plots:\n"
-    "  import matplotlib; matplotlib.use('Agg')\n"
-    "  import matplotlib.pyplot as plt, base64, io\n"
-    "  fig, ax = plt.subplots()\n"
-    "  ax.plot([1,2,3],[4,5,6])\n"
-    "  buf = io.BytesIO()\n"
-    "  fig.savefig(buf, format='png'); buf.seek(0)\n"
-    "  print(base64.b64encode(buf.read()).decode())\n"
-    "  plt.close()\n"
+    "Network access (HTTP):\n"
+    "- Two built-in globals are available — no import needed:\n"
+    "    http_get(url)  -> dict with 'status' (int) and 'body' (str)\n"
+    "    http_post(url, body='', content_type='application/json')"
+    "  -> dict with 'status' (int) and 'body' (str)\n"
+    "- Network access is restricted to domains allowlisted by the host.\n"
+    "  Requests to non-allowed domains will raise an error.\n"
+    "- Example:\n"
+    "  resp = http_get('https://httpbin.org/get')\n"
+    "  print(resp['status'])  # 200\n"
+    "  print(resp['body'])    # JSON response body\n"
     "\n"
-    "Playwright (browser automation):\n"
-    "- ALWAYS use the pre-loaded helper to get a page:\n"
-    "    page = await launch_browser()\n"
-    "  NEVER call async_playwright() or chromium.launch() directly.\n"
-    "  The helper configures optimal settings that are required\n"
-    "  for sites to load properly.\n"
-    "- Call launch_browser() once, then reuse `page` across calls (state persists).\n"
-    "- Use the async API with top-level await.\n"
-    "- To see what's on a page, you can:\n"
-    "  1. Take a screenshot (returns base64 you can analyze):\n"
-    "     import base64\n"
-    "     screenshot_bytes = await page.screenshot(full_page=False)\n"
-    "     print(base64.b64encode(screenshot_bytes).decode())\n"
-    "  2. Extract text from the DOM:\n"
-    "     text = await page.inner_text('body')\n"
-    "     elements = await page.query_selector_all('css selector')\n"
-    "     for el in elements:\n"
-    "         print(await el.text_content())\n"
-    "  Prefer DOM extraction for structured data. Use screenshots\n"
-    "  when you need to understand visual layout or image content.\n"
-    "- Use CSS selectors and aria attributes to find and interact\n"
-    "  with elements.\n"
+    "  resp = http_post('https://httpbin.org/post',"
+    " body='{\"key\": \"value\"}')\n"
+    "  print(resp['body'])\n"
 )
 
 # ---------------------------------------------------------------------------
@@ -133,106 +87,156 @@ def _sanitize_input(code: str) -> str:
     return code
 
 
-def _build_url(endpoint: str, session_id: str) -> str:
-    base = endpoint.rstrip("/")
-    encoded_id = urllib.parse.quote(session_id)
-    return f"{base}/executions?api-version={_API_VERSION}&identifier={encoded_id}"
+# ---------------------------------------------------------------------------
+# Per-session sandbox management
+#
+# The Hyperlight WasmSandbox is !Send (not thread-safe and cannot cross
+# thread boundaries).  All sandbox instances MUST live on a single
+# dedicated worker thread.  The async handler dispatches requests via a
+# queue and awaits the result through a concurrent.futures.Future.
+# ---------------------------------------------------------------------------
+
+import concurrent.futures
+import queue
+
+# Sentinel to shut down the worker thread.
+_SHUTDOWN = object()
+
+# Request queue: each item is either _SHUTDOWN or a tuple of
+# (session_id, code, allowed_domains, heap_size, stack_size, Future).
+_request_queue: queue.Queue = queue.Queue()
+
+# Maximum code payload size (10 MiB) — defence-in-depth matching
+# hyperlight's own limit.
+_MAX_CODE_SIZE = 10 * 1024 * 1024
+
+# Whether the worker thread has been started.
+_worker_started = False
+_worker_start_lock = threading.Lock()
 
 
-async def _execute_code(
-    endpoint: str,
-    code: str,
-    session_id: str,
-    token_provider,
-    http_session: aiohttp.ClientSession,
-) -> str:
-    """Execute Python code in an ACA dynamic session."""
-    code = _sanitize_input(code)
-    token = await token_provider()
-    url = _build_url(endpoint, session_id)
+def _sandbox_worker() -> None:
+    """Dedicated thread that owns all Sandbox instances.
 
-    async with http_session.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "codeInputType": "Inline",
-            "executionType": "Synchronous",
-            "code": code,
-            "timeoutInSeconds": 60,
-        },
-        timeout=aiohttp.ClientTimeout(total=120),
-    ) as response:
-        if response.status >= 400:
-            body = await response.text()
-            raise RuntimeError(f"ACA sessions API error ({response.status}): {body[:500]}")
-        data = await response.json()
+    Sandboxes are created lazily on first use and reused for subsequent
+    calls with the same session ID.  Because everything runs on this
+    single thread, the Rust !Send constraint is satisfied.
+    """
+    sandboxes: Dict[str, Sandbox] = {}
 
-    result = data.get("result", {})
-    return json.dumps(
-        {
-            "result": result.get("executionResult"),
-            "stdout": result.get("stdout", ""),
-            "stderr": result.get("stderr", ""),
-        },
-        indent=2,
-    )
+    while True:
+        item = _request_queue.get()
+        if item is _SHUTDOWN:
+            break
+
+        session_id, code, allowed_domains, heap_size, stack_size, fut = item
+        try:
+            # Get-or-create sandbox for this session
+            if session_id not in sandboxes:
+                kwargs: Dict[str, Any] = {
+                    "backend": "wasm",
+                    "module": "python_guest.path",
+                }
+                if heap_size:
+                    kwargs["heap_size"] = heap_size
+                if stack_size:
+                    kwargs["stack_size"] = stack_size
+
+                sandbox = Sandbox(**kwargs)
+
+                # Apply network allowlist from agent frontmatter
+                for entry in allowed_domains:
+                    url = entry.get("url", "")
+                    if not url:
+                        continue
+                    url = resolve_env_var(str(url))
+                    methods = entry.get("methods")
+                    sandbox.allow_domain(url, methods=methods)
+                    logging.info(
+                        "execution_sandbox: allowed domain %s (methods=%s)",
+                        url,
+                        methods or "ALL",
+                    )
+
+                # Warm up the sandbox runtime (first run triggers init)
+                sandbox.run("None")
+                sandboxes[session_id] = sandbox
+                logging.info(
+                    "execution_sandbox: created sandbox for session %s "
+                    "(heap=%s, stack=%s, domains=%d)",
+                    session_id,
+                    heap_size or "default",
+                    stack_size or "default",
+                    len(allowed_domains),
+                )
+
+            sandbox = sandboxes[session_id]
+            result = sandbox.run(code)
+            result_json = json.dumps(
+                {
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "exit_code": result.exit_code,
+                },
+                indent=2,
+            )
+            fut.set_result(result_json)
+        except Exception as exc:
+            fut.set_exception(exc)
+
+
+def _ensure_worker_started() -> None:
+    """Start the sandbox worker thread if it hasn't been started yet."""
+    global _worker_started
+    if _worker_started:
+        return
+    with _worker_start_lock:
+        if _worker_started:
+            return
+        t = threading.Thread(
+            target=_sandbox_worker, daemon=True, name="sandbox-worker"
+        )
+        t.start()
+        _worker_started = True
+        logging.info("execution_sandbox: worker thread started")
 
 
 # ---------------------------------------------------------------------------
 # Factory: create per-agent execute_python tool
 # ---------------------------------------------------------------------------
 
-# Shared credential and HTTP session (created lazily, reused across agents)
-_credential: Optional[DefaultAzureCredential] = None
-_token_provider = None
-_http_session: Optional[aiohttp.ClientSession] = None
-_init_lock = asyncio.Lock()
-
-# Track which ACA sessions have been set up (Playwright helper loaded)
-_setup_sessions: set[str] = set()
-_setup_lock = asyncio.Lock()
-
-
-async def _ensure_shared_resources():
-    """Lazily create the shared credential, token provider, and HTTP session."""
-    global _credential, _token_provider, _http_session
-    if _token_provider is not None:
-        return
-    async with _init_lock:
-        if _token_provider is not None:
-            return
-        _credential = DefaultAzureCredential()
-        _token_provider = get_bearer_token_provider(
-            _credential, "https://dynamicsessions.io/.default"
-        )
-        _http_session = aiohttp.ClientSession()
-        logging.info("execution_sandbox: shared credential, token provider, and HTTP session initialized")
-
 
 def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
     """Create an execute_python tool for a specific agent's sandbox config.
 
     Returns a list with one Tool, or an empty list if the config is invalid.
-    The endpoint is baked into the tool's closure.
+    The allowed_domains and memory settings are baked into the tool's closure.
+
+    Expected frontmatter structure::
+
+        execution_sandbox:
+          allowed_domains:
+            - url: "https://httpbin.org"
+              methods: ["GET"]          # optional — default: all methods
+            - url: "https://api.example.com"
+          heap_size: "25Mi"             # optional
+          stack_size: "35Mi"            # optional
     """
-    raw_endpoint = config.get("session_pool_management_endpoint", "")
-    if not raw_endpoint:
-        logging.warning("execution_sandbox: missing 'session_pool_management_endpoint', skipping")
-        return []
+    allowed_domains = config.get("allowed_domains", [])
+    if not isinstance(allowed_domains, list):
+        allowed_domains = []
 
-    endpoint = resolve_env_var(str(raw_endpoint))
-    if not endpoint or endpoint.startswith("$") or endpoint.startswith("%"):
-        logging.warning(f"execution_sandbox: could not resolve endpoint '{raw_endpoint}', skipping")
-        return []
+    heap_size = config.get("heap_size")
+    stack_size = config.get("stack_size")
 
-    logging.info(f"execution_sandbox: creating tool with endpoint {endpoint}")
+    logging.info(
+        "execution_sandbox: creating tool (domains=%d, heap=%s, stack=%s)",
+        len(allowed_domains),
+        heap_size or "default",
+        stack_size or "default",
+    )
 
     async def _handle_execute_python(invocation: ToolInvocation) -> ToolResult:
-        await _ensure_shared_resources()
-
         args = invocation.arguments or {}
         code = args.get("code", "")
         if not code.strip():
@@ -241,28 +245,55 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
                 result_type="failure",
             )
 
-        # Use the Copilot session ID as the ACA session ID
-        # so state persists across execute_python calls in the same conversation
-        aca_session_id = invocation.session_id or "default"
+        code = _sanitize_input(code)
+
+        if len(code.encode("utf-8")) > _MAX_CODE_SIZE:
+            return ToolResult(
+                text_result_for_llm=(
+                    '{"error": "Code exceeds maximum size (10 MiB)"}'
+                ),
+                result_type="failure",
+            )
+
+        session_id = invocation.session_id or "default"
         logging.info(
-            f"execution_sandbox: executing code in ACA session {aca_session_id} "
-            f"(tool_call={invocation.tool_call_id})"
+            "execution_sandbox: executing code in session %s "
+            "(tool_call=%s, code_len=%d)",
+            session_id,
+            invocation.tool_call_id,
+            len(code),
         )
 
         try:
-            # Pre-load Playwright helper on first call per session
-            async with _setup_lock:
-                if aca_session_id not in _setup_sessions:
-                    await _execute_code(endpoint, _ACA_SESSION_SETUP, aca_session_id, _token_provider, _http_session)
-                    _setup_sessions.add(aca_session_id)
+            # Ensure the dedicated sandbox worker thread is running
+            _ensure_worker_started()
 
-            # Execute the user's code
-            result = await _execute_code(endpoint, code, aca_session_id, _token_provider, _http_session)
-            logging.info(f"execution_sandbox: ACA session {aca_session_id} completed successfully")
-            return ToolResult(text_result_for_llm=result, result_type="success")
+            # Dispatch to the worker thread via queue and await result.
+            # All sandbox instances live on the worker thread to satisfy
+            # the Rust !Send constraint (WasmSandbox cannot cross threads).
+            fut: concurrent.futures.Future[str] = concurrent.futures.Future()
+            _request_queue.put(
+                (session_id, code, allowed_domains, heap_size, stack_size, fut)
+            )
+
+            # Await without blocking the event loop
+            loop = asyncio.get_running_loop()
+            result_json = await asyncio.wrap_future(fut, loop=loop)
+
+            logging.info(
+                "execution_sandbox: session %s completed successfully",
+                session_id,
+            )
+            return ToolResult(
+                text_result_for_llm=result_json, result_type="success"
+            )
         except Exception as exc:
             error_msg = f"{type(exc).__name__}: {exc}"
-            logging.error(f"execution_sandbox: ACA session {aca_session_id} failed: {error_msg}")
+            logging.error(
+                "execution_sandbox: session %s failed: %s",
+                session_id,
+                error_msg,
+            )
             return ToolResult(
                 text_result_for_llm=json.dumps({"error": error_msg}),
                 result_type="failure",

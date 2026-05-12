@@ -17,6 +17,7 @@ dependencies = [
     "azurefunctions-extensions-http-fastapi",
     "aiohttp>=3.9.0",
     "azure-identity>=1.15.0",
+    "hyperlight-sandbox[wasm,python_guest]>=0.4.0",
 ]
 
 [project.optional-dependencies]

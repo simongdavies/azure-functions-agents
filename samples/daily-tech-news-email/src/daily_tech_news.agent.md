@@ -7,7 +7,13 @@ trigger:
   schedule: "0 0 15 * * *"
 
 execution_sandbox:
-  session_pool_management_endpoint: $ACA_SESSION_POOL_ENDPOINT
+  allowed_domains:
+    - url: "https://news.ycombinator.com"
+      methods: ["GET"]
+    - url: "https://rss.nytimes.com"
+      methods: ["GET"]
+    - url: "https://feeds.bbci.co.uk"
+      methods: ["GET"]
 
 tools_from_connections:
   - connection_id: $O365_CONNECTION_ID

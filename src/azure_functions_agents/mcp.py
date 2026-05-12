@@ -3,7 +3,16 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
-from copilot.session import MCPLocalServerConfig, MCPRemoteServerConfig, MCPServerConfig
+# The Copilot SDK renamed these types between versions:
+#   <= 0.2.x: MCPLocalServerConfig, MCPRemoteServerConfig
+#   >= 0.3.0: MCPStdioServerConfig,  MCPHTTPServerConfig
+# Support both so the package works with either SDK version.
+try:
+    from copilot.session import MCPLocalServerConfig, MCPRemoteServerConfig, MCPServerConfig
+except ImportError:
+    from copilot.session import MCPStdioServerConfig as MCPLocalServerConfig  # type: ignore[no-redef]
+    from copilot.session import MCPHTTPServerConfig as MCPRemoteServerConfig  # type: ignore[no-redef]
+    from copilot.session import MCPServerConfig
 
 from .config import get_app_root
 
