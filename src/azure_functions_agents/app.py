@@ -19,7 +19,14 @@ from typing import Any, Dict, List, Optional
 import azure.functions as func
 import frontmatter
 
-from .config import get_app_root, set_app_root, resolve_env_var, substitute_env_vars_in_text, _to_bool
+from .config import (
+    _to_bool,
+    check_agent_dirs_at_startup,
+    get_app_root,
+    resolve_env_var,
+    set_app_root,
+    substitute_env_vars_in_text,
+)
 from .connector_tool_cache import configure_connector_tools
 from .runner import run_copilot_agent, run_copilot_agent_stream
 from .sandbox import create_sandbox_tools
@@ -523,6 +530,11 @@ def create_function_app(app_root: Path | None = None) -> func.FunctionApp:
         set_app_root(app_root)
 
     resolved_root = get_app_root()
+
+    # Warn early if the configured AGENT_INPUT_DIR / AGENT_OUTPUT_DIR are
+    # missing in container deployments — surfaces misconfiguration at
+    # startup rather than on first sandbox/CLI invocation.
+    check_agent_dirs_at_startup()
 
     app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 

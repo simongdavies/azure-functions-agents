@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import threading
 from typing import Any, Dict, List, Optional
@@ -28,33 +29,73 @@ from typing import Any, Dict, List, Optional
 from copilot.tools import Tool, ToolInvocation, ToolResult
 from hyperlight_sandbox import Sandbox
 
-from .config import resolve_env_var
+from .config import (
+    get_agent_input_dir,
+    get_agent_input_tmp_dir,
+    get_agent_output_dir,
+    resolve_env_var,
+)
+
+# ---------------------------------------------------------------------------
+# Filesystem mounts
+#
+# The Hyperlight Wasm guest always exposes ``/input`` (read-only) and
+# ``/output`` (read-write) at fixed paths.  The corresponding *host-side*
+# directories — what the function-app process sees — are configurable via
+# the ``AGENT_INPUT_DIR`` / ``AGENT_OUTPUT_DIR`` env vars (see
+# :mod:`config`).  Both default to the basic-chat container layout
+# (``/sandbox/in`` and ``/sandbox/out``), and both must exist on disk
+# before the Sandbox is constructed — the container image creates empty
+# placeholders so the unmounted case still works.
+# ---------------------------------------------------------------------------
+
+# Read-only access to ``/input`` is the **floor** — there is no "off"
+# setting.  The Copilot CLI parks large tool outputs under
+# ``<AGENT_INPUT_DIR>/tmp`` to keep them out of the model context (see
+# client_manager.py for the TMPDIR override), and the guest sandbox needs
+# ``/input`` to read those files.  Agents opt in to writable scratch space
+# via ``filesystem: read_write``.
+_FILESYSTEM_MODE_READ_ONLY = "read_only"
+_FILESYSTEM_MODE_READ_WRITE = "read_write"
+
+_FILESYSTEM_VALID_MODES = {
+    _FILESYSTEM_MODE_READ_ONLY,
+    _FILESYSTEM_MODE_READ_WRITE,
+}
+
+# Legacy frontmatter values silently upgraded to read_only (with a warning).
+_FILESYSTEM_LEGACY_DISABLE_VALUES = {"none", "off", "false", "disabled"}
 
 # ---------------------------------------------------------------------------
 # Tool description
 # ---------------------------------------------------------------------------
 
-_EXECUTE_PYTHON_DESCRIPTION = (
+_EXECUTE_PYTHON_BASE_DESCRIPTION = (
     "Execute Python code in a persistent sandboxed environment backed by"
     " a Hyperlight Wasm sandbox. Returns JSON with stdout, stderr, and"
     " exit_code.\n"
     "\n"
-    "IMPORTANT: This runs in an ISOLATED SANDBOX with its own file system."
-    " DO NOT use it to read or process files from the local system,"
-    " such as copilot large tool outputs. Use the view, head, tail, grep,"
-    " or jq tools instead.\n"
+    "When to use this tool:\n"
+    "- Computation, data processing, parsing, or transformation.\n"
+    "- Calling HTTP APIs via the built-in http_get / http_post globals.\n"
+    "- Reading and processing files the host has made available under"
+    " /input (see the filesystem section below), including large tool"
+    " outputs the Copilot CLI has parked at /input/tmp/.\n"
+    "- Writing artefacts to /output when that path is available.\n"
     "\n"
-    "Only use this tool when you need to actually run code,"
-    " when no other tool can accomplish the task (there's a small cost to"
-    " using it) — computation, data processing, fetching web data, etc."
-    " Do NOT call this tool just to print text, format output, or display"
-    " results you already have. Respond directly with text instead.\n"
+    "When NOT to use this tool:\n"
+    "- To print or format text you already have — respond directly with"
+    " text instead.\n"
+    "- For quick peeks at a file — the view, head, tail, grep, and jq"
+    " tools operate directly on the host filesystem and are cheaper than"
+    " spinning up the sandbox.\n"
     "\n"
-    "Key behaviors:\n"
-    "- State persists across calls: variables, imports, and files"
-    " are retained between invocations within the same conversation.\n"
-    "- Use print() for ALL output — there is no implicit last-expression"
-    " return like Jupyter. Output appears in 'stdout'.\n"
+    "Key behaviours:\n"
+    "- State persists across calls within the same conversation:"
+    " variables, imports, and files written inside the sandbox are"
+    " retained between invocations.\n"
+    "- Use print() for ALL output — only stdout, stderr, and exit_code"
+    " are captured.\n"
     "- Common modules are available: math, json, re, datetime,"
     " collections, itertools, functools, etc.\n"
     "\n"
@@ -75,6 +116,67 @@ _EXECUTE_PYTHON_DESCRIPTION = (
     "  print(resp['body'])\n"
 )
 
+_FILESYSTEM_DESCRIPTION_READ_ONLY = (
+    "\n"
+    "Filesystem access:\n"
+    "- '/input' is a read-only directory containing files provided by the"
+    " host. Use it to load datasets, configuration, or any other files"
+    " supplied by the operator.\n"
+    "- '/input/tmp/' is where the Copilot CLI parks large tool outputs to"
+    " keep them out of the model context. The CLI reports these on the"
+    " host as '{host_tmp}/<file>'. Inside this sandbox the same files"
+    " are visible at '/input/tmp/<file>'.\n"
+    "- For quick scans of a large CLI output, prefer the view, head,"
+    " tail, grep, or jq tools (they run directly on the host filesystem"
+    " against '{host_tmp}/<file>' — no sandbox roundtrip)."
+    " Reach for execute_python when you need to compute over the data.\n"
+    "- Writes to '/input' will fail; this configuration has no writable"
+    " scratch directory.\n"
+    "- Example: ``with open('/input/data.csv') as f: rows = f.read()``\n"
+)
+
+_FILESYSTEM_DESCRIPTION_READ_WRITE = (
+    "\n"
+    "Filesystem access:\n"
+    "- '/input' is a read-only directory containing files provided by the"
+    " host (datasets, configuration, etc.).\n"
+    "- '/input/tmp/' is where the Copilot CLI parks large tool outputs to"
+    " keep them out of the model context. The CLI reports these on the"
+    " host as '{host_tmp}/<file>'. Inside this sandbox the same files"
+    " are visible at '/input/tmp/<file>'. For quick scans, prefer view /"
+    " head / tail / grep / jq on the host path; reach for execute_python"
+    " only when you actually need to compute over the data.\n"
+    "- '/output' is a writable directory backed by a real host directory."
+    " Files you create there persist across calls, across turns within a"
+    " conversation, and (when the operator bind-mounts the directory)"
+    " across container restarts.\n"
+    "- Example: ``with open('/output/result.json', 'w') as f:"
+    " json.dump(data, f)``\n"
+)
+
+
+def _build_tool_description(filesystem_mode: str) -> str:
+    """Return the execute_python description tailored to the FS config.
+
+    ``read_only`` is the floor — ``_normalize_filesystem_mode`` guarantees
+    every caller lands on one of the two valid modes, so there is no
+    bare-base path.
+
+    The filesystem section embeds the *current* host-side path for the
+    CLI temp directory so the model is told the real on-disk location
+    even when the operator has overridden ``AGENT_INPUT_DIR``.
+    """
+    host_tmp = get_agent_input_tmp_dir()
+    if filesystem_mode == _FILESYSTEM_MODE_READ_WRITE:
+        return (
+            _EXECUTE_PYTHON_BASE_DESCRIPTION
+            + _FILESYSTEM_DESCRIPTION_READ_WRITE.format(host_tmp=host_tmp)
+        )
+    return (
+        _EXECUTE_PYTHON_BASE_DESCRIPTION
+        + _FILESYSTEM_DESCRIPTION_READ_ONLY.format(host_tmp=host_tmp)
+    )
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -85,6 +187,107 @@ def _sanitize_input(code: str) -> str:
     code = re.sub(r"^(\s|`)*(?i:python)?\s*", "", code)
     code = re.sub(r"(\s|`)*$", "", code)
     return code
+
+
+def _normalize_filesystem_mode(value: Any) -> str:
+    """Normalize the ``filesystem`` frontmatter setting to a known mode.
+
+    Read-only filesystem access is the **floor** — there is no "off"
+    setting because the host needs ``/input`` mounted so the guest can
+    read large tool outputs parked under ``/input/tmp/``.
+
+    Accepts:
+
+    - ``None`` / missing / ``False``  → ``"read_only"`` (the floor)
+    - ``True``                         → ``"read_write"`` (boolean shorthand)
+    - The strings ``"read_only"``, ``"read_write"``
+      (case-insensitive, hyphens accepted)
+    - Legacy ``"none"`` / ``"off"`` / ``"false"`` / ``"disabled"`` →
+      ``"read_only"`` with a warning (kept for forward-compat with older
+      agent.md files).
+
+    Unknown values fall back to ``"read_only"`` with a warning so a typo
+    cannot silently break agents.
+    """
+    if value is None or value is False:
+        return _FILESYSTEM_MODE_READ_ONLY
+    if value is True:
+        return _FILESYSTEM_MODE_READ_WRITE
+    if isinstance(value, str):
+        candidate = value.strip().lower().replace("-", "_")
+        if candidate in _FILESYSTEM_LEGACY_DISABLE_VALUES:
+            logging.warning(
+                "execution_sandbox: filesystem=%r is no longer supported;"
+                " using 'read_only' (the new floor).",
+                value,
+            )
+            return _FILESYSTEM_MODE_READ_ONLY
+        if candidate in _FILESYSTEM_VALID_MODES:
+            return candidate
+    logging.warning(
+        "execution_sandbox: ignoring unknown filesystem=%r (expected one of"
+        " %s, true, or false); defaulting to 'read_only'",
+        value,
+        sorted(_FILESYSTEM_VALID_MODES),
+    )
+    return _FILESYSTEM_MODE_READ_ONLY
+
+
+# Default HTTP methods applied when the shorthand form omits them.
+_SHORTHAND_DEFAULT_METHODS = ["GET"]
+
+
+def _parse_shorthand_allowed_domains(raw: str) -> List[Dict[str, Any]]:
+    """Parse the compact string form of ``execution_sandbox.allowed_domains``.
+
+    Format::
+
+        "host[,METHOD,...][;host[,METHOD,...]]..."
+
+    Rules:
+
+    - Entries are separated by ``;``.
+    - Within each entry, the first token is the host and the remaining
+      tokens are HTTP methods.
+    - Methods are case-insensitive (stored uppercase).
+    - Missing methods default to ``["GET"]``.
+    - Bare hostnames are normalized to ``https://<host>``.
+    - Hostnames already prefixed with ``http://`` / ``https://`` are kept
+      verbatim.
+    - Hostnames beginning with ``$`` or ``%`` are env-var references and are
+      left unchanged here; :func:`resolve_env_var` resolves them later when
+      the sandbox is constructed.
+    - Empty entries (e.g. a trailing ``;``) are ignored.
+
+    Example::
+
+        "api.github.com,GET,POST;httpbin.org"
+        -> [
+            {"url": "https://api.github.com", "methods": ["GET", "POST"]},
+            {"url": "https://httpbin.org",    "methods": ["GET"]},
+          ]
+    """
+    result: List[Dict[str, Any]] = []
+    for entry in raw.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        tokens = [t.strip() for t in entry.split(",") if t.strip()]
+        if not tokens:
+            continue
+        host = tokens[0]
+        if not (
+            host.startswith("http://")
+            or host.startswith("https://")
+            or host.startswith("$")
+            or host.startswith("%")
+        ):
+            host = f"https://{host}"
+        methods = [t.upper() for t in tokens[1:]] or list(
+            _SHORTHAND_DEFAULT_METHODS
+        )
+        result.append({"url": host, "methods": methods})
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +306,8 @@ import queue
 _SHUTDOWN = object()
 
 # Request queue: each item is either _SHUTDOWN or a tuple of
-# (session_id, code, allowed_domains, heap_size, stack_size, Future).
+# (session_id, code, allowed_domains, heap_size, stack_size,
+#  filesystem_mode, Future).
 _request_queue: queue.Queue = queue.Queue()
 
 # Maximum code payload size (10 MiB) — defence-in-depth matching
@@ -129,7 +333,15 @@ def _sandbox_worker() -> None:
         if item is _SHUTDOWN:
             break
 
-        session_id, code, allowed_domains, heap_size, stack_size, fut = item
+        (
+            session_id,
+            code,
+            allowed_domains,
+            heap_size,
+            stack_size,
+            filesystem_mode,
+            fut,
+        ) = item
         try:
             # Get-or-create sandbox for this session
             if session_id not in sandboxes:
@@ -141,6 +353,48 @@ def _sandbox_worker() -> None:
                     kwargs["heap_size"] = heap_size
                 if stack_size:
                     kwargs["stack_size"] = stack_size
+
+                # Filesystem mounts.  Hyperlight always exposes the guest
+                # paths /input and /output; we wire those to host-side
+                # paths from AGENT_INPUT_DIR / AGENT_OUTPUT_DIR (defaults
+                # /sandbox/in and /sandbox/out — see config.py).
+                #
+                # The frontmatter expresses INTENT ("I want read_only /
+                # read_write filesystem access"); the host environment
+                # decides what's actually available.  On hosts that don't
+                # provide the mount points (e.g. Azure Functions Linux
+                # consumption plan, dev machines without the basic-chat
+                # container layout, or operators who set AGENT_INPUT_DIR
+                # to a path that doesn't yet exist), we log a warning and
+                # silently skip the mount so the sandbox can still be
+                # constructed and used for non-FS work.
+                host_input_dir = get_agent_input_dir()
+                host_output_dir = get_agent_output_dir()
+                if os.path.isdir(host_input_dir):
+                    kwargs["input_dir"] = host_input_dir
+                else:
+                    logging.warning(
+                        "execution_sandbox: host directory %s is missing;"
+                        " /input will not be available inside the sandbox."
+                        " If you intended to expose host files to the"
+                        " guest, create the directory (and bind-mount real"
+                        " content into it) before starting the function"
+                        " app, or set AGENT_INPUT_DIR to an existing path.",
+                        host_input_dir,
+                    )
+                if filesystem_mode == _FILESYSTEM_MODE_READ_WRITE:
+                    if os.path.isdir(host_output_dir):
+                        kwargs["output_dir"] = host_output_dir
+                    else:
+                        logging.warning(
+                            "execution_sandbox: filesystem=read_write was"
+                            " requested but host directory %s is missing;"
+                            " /output will not be available inside the"
+                            " sandbox. Create (and ideally bind-mount)"
+                            " the directory to enable persistent writes,"
+                            " or set AGENT_OUTPUT_DIR to an existing path.",
+                            host_output_dir,
+                        )
 
                 sandbox = Sandbox(**kwargs)
 
@@ -163,11 +417,12 @@ def _sandbox_worker() -> None:
                 sandboxes[session_id] = sandbox
                 logging.info(
                     "execution_sandbox: created sandbox for session %s "
-                    "(heap=%s, stack=%s, domains=%d)",
+                    "(heap=%s, stack=%s, domains=%d, filesystem=%s)",
                     session_id,
                     heap_size or "default",
                     stack_size or "default",
                     len(allowed_domains),
+                    filesystem_mode,
                 )
 
             sandbox = sandboxes[session_id]
@@ -212,7 +467,17 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
     Returns a list with one Tool, or an empty list if the config is invalid.
     The allowed_domains and memory settings are baked into the tool's closure.
 
-    Expected frontmatter structure::
+    ``allowed_domains`` accepts two forms:
+
+    1. **Compact string** (recommended)::
+
+        execution_sandbox:
+          allowed_domains: "api.github.com,GET,POST;httpbin.org"
+
+       See :func:`_parse_shorthand_allowed_domains` for the full grammar.
+       Default method when none is listed is ``GET``.
+
+    2. **Explicit list** (also supported, useful for programmatic config)::
 
         execution_sandbox:
           allowed_domains:
@@ -221,19 +486,48 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
             - url: "https://api.example.com"
           heap_size: "25Mi"             # optional
           stack_size: "35Mi"            # optional
+          filesystem: read_write        # optional: read_only | read_write
+                                        # default: read_only (the floor)
+
+    Filesystem mounts:
+
+    ``read_only`` is the **floor** — there is no way to fully disable
+    filesystem access, because the Copilot CLI writes large tool outputs
+    into ``<AGENT_INPUT_DIR>/tmp`` (see ``client_manager.py``) and the
+    guest needs ``/input`` to read them.
+
+    - ``read_only`` (default) — guest sees ``/input`` (read-only) mapped
+      to the host-side ``AGENT_INPUT_DIR`` (defaults to ``/sandbox/in``).
+      The CLI's parked tool outputs are visible at ``/input/tmp/<file>``.
+    - ``read_write`` — guest also sees ``/output`` (writable) mapped to
+      ``AGENT_OUTPUT_DIR`` (defaults to ``/sandbox/out``).
+
+    Both host paths exist as empty placeholders in the basic-chat
+    container image; bind-mount real host directories with
+    ``-v <host>:<AGENT_INPUT_DIR>`` and ``-v <host>:<AGENT_OUTPUT_DIR>``
+    to persist data across runs.  Override the container-side paths via
+    the ``AGENT_INPUT_DIR`` / ``AGENT_OUTPUT_DIR`` env vars when the
+    image uses a different layout.
     """
-    allowed_domains = config.get("allowed_domains", [])
-    if not isinstance(allowed_domains, list):
+    raw_allowed_domains = config.get("allowed_domains", [])
+    if isinstance(raw_allowed_domains, str):
+        allowed_domains = _parse_shorthand_allowed_domains(raw_allowed_domains)
+    elif isinstance(raw_allowed_domains, list):
+        allowed_domains = raw_allowed_domains
+    else:
         allowed_domains = []
 
     heap_size = config.get("heap_size")
     stack_size = config.get("stack_size")
+    filesystem_mode = _normalize_filesystem_mode(config.get("filesystem"))
 
     logging.info(
-        "execution_sandbox: creating tool (domains=%d, heap=%s, stack=%s)",
+        "execution_sandbox: creating tool (domains=%d, heap=%s, stack=%s,"
+        " filesystem=%s)",
         len(allowed_domains),
         heap_size or "default",
         stack_size or "default",
+        filesystem_mode,
     )
 
     async def _handle_execute_python(invocation: ToolInvocation) -> ToolResult:
@@ -273,7 +567,15 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
             # the Rust !Send constraint (WasmSandbox cannot cross threads).
             fut: concurrent.futures.Future[str] = concurrent.futures.Future()
             _request_queue.put(
-                (session_id, code, allowed_domains, heap_size, stack_size, fut)
+                (
+                    session_id,
+                    code,
+                    allowed_domains,
+                    heap_size,
+                    stack_size,
+                    filesystem_mode,
+                    fut,
+                )
             )
 
             # Await without blocking the event loop
@@ -301,7 +603,7 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
 
     tool = Tool(
         name="execute_python",
-        description=_EXECUTE_PYTHON_DESCRIPTION,
+        description=_build_tool_description(filesystem_mode),
         parameters={
             "type": "object",
             "properties": {

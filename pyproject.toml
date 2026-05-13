@@ -24,9 +24,26 @@ dependencies = [
 connectors = [
     "azure-functions-connectors @ https://github.com/anthonychu/azure-functions-connectors-python/releases/download/v0.1.0b2/azure_functions_connectors-0.1.0b2-py3-none-any.whl",
 ]
+dev = [
+    "pytest>=7.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 azure_functions_agents = ["public/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Opt out of any conftest.py in the project root (there is none) so
+# pytest only discovers tests under ``tests/``.
+norecursedirs = [
+    ".git",
+    ".venv",
+    "build",
+    "dist",
+    "infra",
+    "samples",
+    "src",
+]

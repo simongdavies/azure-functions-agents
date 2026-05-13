@@ -1,5 +1,6 @@
 import logging
 import os
+import posixpath
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -86,6 +87,107 @@ def session_exists(config_dir: Optional[str], session_id: str) -> bool:
     exists = os.path.isdir(session_path)
     logging.info(f"Session '{session_id}' exists at {session_path}: {exists}")
     return exists
+
+
+# ---------------------------------------------------------------------------
+# Sandbox host-side directory resolution
+# ---------------------------------------------------------------------------
+#
+# The Hyperlight Wasm guest always exposes ``/input`` (read-only) and
+# ``/output`` (read-write) at fixed paths.  The corresponding *host-side*
+# directories — what the function-app process and the Copilot CLI
+# subprocess see — are configurable via env vars so the library is not
+# locked to one container layout:
+#
+#   AGENT_INPUT_DIR  (default: /sandbox/in)  → bind-mount target for /input
+#   AGENT_OUTPUT_DIR (default: /sandbox/out) → bind-mount target for /output
+#
+# The CLI temp directory is always derived as ``<input_dir>/tmp`` so the
+# parked tool outputs are visible both to the Hyperlight guest at
+# ``/input/tmp/<file>`` and to the host-side view/head/tail/grep/jq
+# tools at ``<input_dir>/tmp/<file>`` — one file on disk, two readers,
+# zero copies.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_AGENT_INPUT_DIR = "/sandbox/in"
+_DEFAULT_AGENT_OUTPUT_DIR = "/sandbox/out"
+
+
+def get_agent_input_dir() -> str:
+    """Return the host-side directory bound into the sandbox as ``/input``.
+
+    Configurable via the ``AGENT_INPUT_DIR`` env var; defaults to
+    ``/sandbox/in`` (matches the basic-chat container layout).
+
+    Returned as a POSIX-style path with forward slashes — the value is
+    consumed by Linux processes (the Hyperlight sandbox, the Copilot
+    CLI's Node.js runtime running inside a Linux container), so we must
+    not let ``os.path`` rewrite it with Windows separators on dev boxes.
+    """
+    return os.environ.get("AGENT_INPUT_DIR", _DEFAULT_AGENT_INPUT_DIR)
+
+
+def get_agent_output_dir() -> str:
+    """Return the host-side directory bound into the sandbox as ``/output``.
+
+    Configurable via the ``AGENT_OUTPUT_DIR`` env var; defaults to
+    ``/sandbox/out`` (matches the basic-chat container layout).
+
+    See :func:`get_agent_input_dir` for why this stays POSIX-style.
+    """
+    return os.environ.get("AGENT_OUTPUT_DIR", _DEFAULT_AGENT_OUTPUT_DIR)
+
+
+def get_agent_input_tmp_dir() -> str:
+    """Return ``<input_dir>/tmp`` — where the Copilot CLI parks large outputs.
+
+    Both the host-side view/head/tail/grep/jq tools and the Hyperlight
+    guest (at ``/input/tmp``) read these files from this single shared
+    location.  Always derived from :func:`get_agent_input_dir` so the two
+    cannot drift out of sync.  Uses :mod:`posixpath` so the result stays
+    forward-slash on every dev OS.
+    """
+    return posixpath.join(get_agent_input_dir(), "tmp")
+
+
+def check_agent_dirs_at_startup() -> None:
+    """Log warnings if the configured host-side dirs are missing at startup.
+
+    Only fires when ``CONTAINER_NAME`` is set — i.e. we know we are
+    running in a container deployment where the bind mounts are *expected*
+    to exist.  In dev mode the missing dirs are normal and we stay silent
+    (the lazy per-component checks in ``client_manager.py`` and
+    ``sandbox.py`` will degrade gracefully).
+    """
+    if not os.environ.get("CONTAINER_NAME"):
+        return
+    input_dir = get_agent_input_dir()
+    output_dir = get_agent_output_dir()
+    tmp_dir = get_agent_input_tmp_dir()
+    if not os.path.isdir(input_dir):
+        logging.warning(
+            "AGENT_INPUT_DIR=%s does not exist. The Copilot CLI's"
+            " temp-redirect, the host-side file tools, and the sandbox"
+            " /input mount will all be unavailable. Create the directory"
+            " (or bind-mount real content) before starting the app.",
+            input_dir,
+        )
+    elif not os.path.isdir(tmp_dir):
+        logging.warning(
+            "AGENT_INPUT_DIR=%s exists but %s does not. The Copilot CLI"
+            " will fall back to the system temp dir, and large tool"
+            " outputs will not be visible to the host-side file tools or"
+            " to the sandbox /input/tmp/.",
+            input_dir,
+            tmp_dir,
+        )
+    if not os.path.isdir(output_dir):
+        logging.warning(
+            "AGENT_OUTPUT_DIR=%s does not exist. The sandbox /output"
+            " mount will be unavailable to agents that request"
+            " filesystem: read_write.",
+            output_dir,
+        )
 
 
 # ---------------------------------------------------------------------------

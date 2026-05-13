@@ -11,7 +11,7 @@ from typing import Callable, List, Optional
 from copilot import define_tool
 from pydantic import BaseModel, Field
 
-from .config import get_app_root
+from .config import get_agent_input_tmp_dir, get_app_root
 
 
 def discover_tools() -> List[Callable]:
@@ -83,6 +83,18 @@ def discover_tools() -> List[Callable]:
 _ALLOWED_READ_DIRS = [
     os.path.normpath(tempfile.gettempdir()),
 ]
+
+# The Copilot CLI is launched by client_manager.py with TMPDIR set to
+# the configured agent input tmp directory (``<AGENT_INPUT_DIR>/tmp``,
+# defaulting to ``/sandbox/in/tmp`` in the basic-chat container) when
+# that directory exists.  Large tool outputs the CLI parks on disk
+# therefore land at ``<AGENT_INPUT_DIR>/tmp/<file>``, which is also
+# visible to the Hyperlight guest at ``/input/tmp/<file>``.  Adding the
+# host-side path here lets the view/head/tail/grep/jq tools read those
+# files directly without a sandbox roundtrip.  Harmless on machines
+# where the path does not exist: the file-not-found check in
+# _check_access still fires.
+_ALLOWED_READ_DIRS.append(os.path.normpath(get_agent_input_tmp_dir()))
 
 # Allow reading skill reference files from {approot}/skills/
 _skills_dir = os.path.join(str(get_app_root()), "skills")

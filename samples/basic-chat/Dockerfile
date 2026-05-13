@@ -15,6 +15,16 @@
 #     -e GITHUB_TOKEN=<your-token> \
 #     basic-chat
 #
+# Optional — persist the Python sandbox's /input and /output to the host so
+# files survive between turns (and between container restarts):
+#   podman run --rm -it \
+#     --device /dev/kvm \
+#     -p 7071:7071 \
+#     -e GITHUB_TOKEN=<your-token> \
+#     -v $HOME/sandbox-in:/sandbox/in \
+#     -v $HOME/sandbox-out:/sandbox/out \
+#     basic-chat
+#
 # Then open http://localhost:7071 in your browser.
 # ---------------------------------------------------------------------------
 
@@ -41,6 +51,20 @@ RUN apt-get update && \
 
 # --- Install Azurite (Azure Storage emulator) ------------------------------
 RUN npm install -g azurite
+
+# --- Pre-create Hyperlight sandbox mount points ----------------------------
+# The Wasm guest always exposes /input (read-only) and /output (read-write)
+# at fixed paths.  We map those to /sandbox/in and /sandbox/out inside the
+# container; operators can bind-mount real host directories there with
+# `-v <host>:/sandbox/in` and `-v <host>:/sandbox/out`.  When nothing is
+# mounted these empty placeholders keep the Sandbox constructor happy.
+#
+# /sandbox/in/tmp is the well-known sub-directory where the Copilot CLI
+# parks large tool outputs (client_manager.py overrides TMPDIR for the
+# subprocess).  The same files are visible to the Hyperlight guest at
+# /input/tmp/<file>.
+RUN mkdir -p /sandbox/in/tmp /sandbox/out && \
+    chmod 0777 /sandbox/in /sandbox/in/tmp /sandbox/out
 
 # --- Install the SDK from local source ------------------------------------
 COPY pyproject.toml /tmp/sdk/pyproject.toml
