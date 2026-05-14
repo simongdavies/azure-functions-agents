@@ -17,7 +17,15 @@ dependencies = [
     "azurefunctions-extensions-http-fastapi",
     "aiohttp>=3.9.0",
     "azure-identity>=1.15.0",
-    "hyperlight-sandbox[wasm,python_guest]>=0.4.0",
+    # Pinned to commit a5fd123 on simongdavies/hyperlight-sandbox feat/scoped-credentials.
+    # Three direct refs (one per package) because pip resolves `[wasm]` /
+    # `[python_guest]` extras by name against PyPI, and the core package's
+    # `optional-dependencies` field carries no git URL. Revert to a single
+    # `hyperlight-sandbox[wasm,python_guest]>=X` line once the fork lands
+    # upstream and a release is published.
+    "hyperlight-sandbox @ git+https://github.com/simongdavies/hyperlight-sandbox.git@a5fd123648bd4ba411cb194633f978c553845a92#subdirectory=src/sdk/python/core",
+    "hyperlight-sandbox-backend-wasm @ git+https://github.com/simongdavies/hyperlight-sandbox.git@a5fd123648bd4ba411cb194633f978c553845a92#subdirectory=src/sdk/python/wasm_backend",
+    "hyperlight-sandbox-python-guest @ git+https://github.com/simongdavies/hyperlight-sandbox.git@a5fd123648bd4ba411cb194633f978c553845a92#subdirectory=src/sdk/python/wasm_guests/python_guest",
 ]
 
 [project.optional-dependencies]
