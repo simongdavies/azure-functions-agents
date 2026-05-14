@@ -631,32 +631,43 @@ def _sandbox_worker() -> None:
                 # before the warmup ``run("None")`` -- gives the guest
                 # both gates active by the time any agent code runs.
                 #
-                # Token values are fetched on the worker thread
-                # (per design Q3: "lazily at session boot") so the
-                # latency is paid on the FIRST execute_python call in a
-                # session, not at app startup -- and a transient IMDS
-                # outage at deploy time is recoverable on the next
-                # request, not a hard boot failure.
+                # The resolver is a **callable** (not a literal token):
+                # the fork invokes it on every credentialed outgoing
+                # request, so IMDS-token rotation, env-var changes, and
+                # transient IMDS outages are handled at request time,
+                # not session-boot time.  Token caching (5-min refresh
+                # window) lives inside :mod:`credentials.azure_imds`,
+                # so we are not hammering IMDS per request -- but we
+                # ARE picking up rotated tokens within the cache TTL.
                 #
                 # The literal token never crosses the host -> guest
-                # boundary as guest-runnable bytes: it is fed via the
-                # WIT-typed ``resolver`` argument that the guest reads
-                # by *id* only (threat-model P1).
+                # boundary as guest-runnable bytes: it is produced on
+                # the host inside this closure and handed to the WIT
+                # ``resolver`` -- the guest only ever references the
+                # credential by *id* (threat-model P1).
+                #
+                # Default-argument capture (``ps=...``, ``r=...``) is
+                # required to bind each iteration's spec into the
+                # closure -- otherwise every closure would close over
+                # the loop variable and resolve the last spec only.
                 for spec in credentials:
-                    token = resolve_credential(
-                        spec.parsed_source,
-                        resource=spec.resource,
-                    )
+                    def _resolver(
+                        ps: ParsedSource = spec.parsed_source,
+                        r: Optional[str] = spec.resource,
+                    ) -> str:
+                        return resolve_credential(ps, resource=r)
+
                     sandbox.register_credential(
                         spec.id,
                         target=spec.target,
                         header=spec.header,
                         prefix=spec.prefix,
-                        resolver=token,
+                        resolver=_resolver,
                     )
                     logging.info(
                         "execution_sandbox: registered credential id=%s"
-                        " target=%s header=%s (token redacted)",
+                        " target=%s header=%s (resolver=callable,"
+                        " token redacted)",
                         spec.id,
                         spec.target,
                         spec.header,
