@@ -42,3 +42,35 @@ def load_module_in_isolation(module_name: str, file_name: str) -> ModuleType:
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def load_package_in_isolation(
+    package_name: str, subpackage_dir: str
+) -> ModuleType:
+    """Load ``src/azure_functions_agents/<subpackage_dir>/`` as a standalone package.
+
+    Like :func:`load_module_in_isolation` but for subpackages (directories
+    with an ``__init__.py``).  The package is registered under
+    ``package_name`` in ``sys.modules`` and given a
+    ``submodule_search_locations`` entry pointing at its own directory so
+    ``from package_name import submodule`` works inside the loaded code
+    without triggering the parent ``azure_functions_agents/__init__.py``.
+
+    The parent ``azure_functions_agents/__init__.py`` pulls in heavy deps
+    (``copilot``, ``hyperlight_sandbox``, …); subpackages that limit
+    themselves to the stdlib (e.g. ``credentials/``) can be tested
+    without paying that import cost.
+    """
+    pkg_path = _PKG_DIR / subpackage_dir
+    init_py = pkg_path / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        package_name,
+        init_py,
+        submodule_search_locations=[str(pkg_path)],
+    )
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise RuntimeError(f"Could not build import spec for {init_py}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[package_name] = module
+    spec.loader.exec_module(module)
+    return module

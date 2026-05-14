@@ -24,7 +24,9 @@ import logging
 import os
 import re
 import threading
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set
+from urllib.parse import urlparse
 
 from copilot.tools import Tool, ToolInvocation, ToolResult
 from hyperlight_sandbox import Sandbox
@@ -34,6 +36,13 @@ from .config import (
     get_agent_input_tmp_dir,
     get_agent_output_dir,
     resolve_env_var,
+)
+from .credentials import (
+    CredentialResolveError,
+    ParsedSource,
+    parse_source,
+    resolve as resolve_credential,
+    validate_id as validate_credential_id,
 )
 
 # ---------------------------------------------------------------------------
@@ -291,6 +300,209 @@ def _parse_shorthand_allowed_domains(raw: str) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Scoped credentials (closed source-type set; see ``credentials/``)
+# ---------------------------------------------------------------------------
+
+# Frontmatter defaults for the ``header`` and ``prefix`` fields on each
+# ``credentials:`` entry.  Mirrors the upstream Sandbox.register_credential
+# defaults so omitting them in agent.md produces the same wire shape.
+_CREDENTIAL_DEFAULT_HEADER = "Authorization"
+_CREDENTIAL_DEFAULT_PREFIX = "Bearer "
+
+
+@dataclass(frozen=True)
+class _CredentialSpec:
+    """A parsed, validated frontmatter ``credentials:`` entry.
+
+    Resolution to a literal token is deferred to the sandbox worker
+    thread (see :func:`_sandbox_worker`) so the runtime call to IMDS /
+    env-lookup happens at session-boot time, not at app-startup time.
+    Storing the :class:`ParsedSource` (rather than the raw string)
+    keeps the worker thread's hot path free of re-parsing and shifts
+    every config error to the parse step where the message is more
+    actionable.
+    """
+
+    id: str
+    parsed_source: ParsedSource
+    target: str
+    resource: Optional[str]
+    header: str
+    prefix: str
+
+
+def _extract_host(target: str) -> str:
+    """Return the bare hostname from a target URL or hostname-only string.
+
+    The host is the key we cross-check against the allow_domain set so a
+    ``credentials.target`` can never reach a destination the
+    allowed_domains list does not also permit (defence-in-depth on top
+    of the guest's own scoping).
+    """
+    if "://" in target:
+        parsed = urlparse(target)
+        return (parsed.hostname or "").lower()
+    return target.split("/", 1)[0].lower()
+
+
+def _normalize_credential_target(target: str) -> str:
+    """Normalize a credential ``target`` to a URL-prefix string.
+
+    Bare hostnames are promoted to ``https://<host>`` so the guest's
+    ``starts_with`` scoping matches the way agents typically write
+    requests (``https://management.azure.com/...``).  Targets that
+    already include a scheme are passed through verbatim.
+    """
+    if target.startswith("http://") or target.startswith("https://"):
+        return target
+    return f"https://{target}"
+
+
+def _parse_credentials(
+    raw: Any,
+    allowed_domain_hosts: Set[str],
+) -> List[_CredentialSpec]:
+    """Validate the ``credentials:`` frontmatter block.
+
+    Performs *all* parse-time validation up front (closed source-type
+    set, id syntax + uniqueness, target-host containment, resource
+    required for IMDS, header / prefix types) so a misconfigured
+    agent.md fails app startup -- not a later, harder-to-debug
+    invocation.
+
+    Returns ``[]`` for missing / ``None`` values; raises
+    :class:`ValueError` on any structural problem.
+
+    ``allowed_domain_hosts`` is the set of bare hostnames already
+    granted by ``execution_sandbox.allowed_domains``.  Any
+    ``credentials[i].target`` whose host is not in that set is a
+    parse-time error: an agent that writes a credentialed request to
+    an un-allowlisted host would just receive a denied-domain error
+    at runtime, so we surface the contradiction now.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(
+            "credentials: must be a list of entries,"
+            f" got {type(raw).__name__}"
+        )
+
+    seen_ids: Set[str] = set()
+    out: List[_CredentialSpec] = []
+
+    for idx, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"credentials[{idx}]: each entry must be a mapping,"
+                f" got {type(entry).__name__}"
+            )
+
+        cred_id = validate_credential_id(entry.get("id"))
+        if cred_id in seen_ids:
+            raise ValueError(
+                f"credentials: duplicate id {cred_id!r}"
+                " (each id must appear at most once)"
+            )
+        seen_ids.add(cred_id)
+
+        source_raw = entry.get("source")
+        if not isinstance(source_raw, str):
+            raise ValueError(
+                f"credentials[{cred_id}]: missing or non-string 'source'"
+            )
+        parsed_source = parse_source(source_raw)
+
+        target = entry.get("target")
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError(
+                f"credentials[{cred_id}]: missing or empty 'target'"
+            )
+        target_stripped = target.strip()
+        target_host = _extract_host(target_stripped)
+        if not target_host:
+            raise ValueError(
+                f"credentials[{cred_id}]: target {target!r} has no host"
+            )
+        if target_host not in allowed_domain_hosts:
+            raise ValueError(
+                f"credentials[{cred_id}]: target host {target_host!r}"
+                " is not in allowed_domains"
+                f" ({sorted(allowed_domain_hosts) or 'empty'})."
+                " Add the host to allowed_domains first;"
+                " credentials may only target hosts the sandbox is"
+                " already permitted to reach."
+            )
+        normalized_target = _normalize_credential_target(target_stripped)
+
+        resource = entry.get("resource")
+        if resource is not None and not isinstance(resource, str):
+            raise ValueError(
+                f"credentials[{cred_id}]: 'resource' must be a string"
+                f" when present, got {type(resource).__name__}"
+            )
+        if parsed_source.kind == "azure_imds" and not resource:
+            raise ValueError(
+                f"credentials[{cred_id}]: 'resource' is required when"
+                " source is 'azure_imds'"
+            )
+
+        header = entry.get("header", _CREDENTIAL_DEFAULT_HEADER)
+        if not isinstance(header, str) or not header:
+            raise ValueError(
+                f"credentials[{cred_id}]: 'header' must be a non-empty"
+                " string"
+            )
+
+        prefix = entry.get("prefix", _CREDENTIAL_DEFAULT_PREFIX)
+        if not isinstance(prefix, str):
+            raise ValueError(
+                f"credentials[{cred_id}]: 'prefix' must be a string"
+                f" (got {type(prefix).__name__});"
+                ' use "" if you do not want one'
+            )
+
+        out.append(
+            _CredentialSpec(
+                id=cred_id,
+                parsed_source=parsed_source,
+                target=normalized_target,
+                resource=resource,
+                header=header,
+                prefix=prefix,
+            )
+        )
+
+    return out
+
+
+def _allowed_domain_hosts(
+    allowed_domains: List[Dict[str, Any]],
+) -> Set[str]:
+    """Return the lower-cased host set covered by ``allowed_domains``.
+
+    The set is used to cross-check ``credentials[i].target`` -- see
+    :func:`_parse_credentials` for the contract.  Entries whose URL
+    is an env-var reference (``$VAR`` / ``%VAR%``) are skipped: we
+    cannot statically know what host they resolve to, and the
+    cross-check would surface a confusing message that names a
+    placeholder rather than the actual config bug.
+    """
+    hosts: Set[str] = set()
+    for entry in allowed_domains:
+        url = entry.get("url", "")
+        if not isinstance(url, str) or not url:
+            continue
+        if url.startswith("$") or url.startswith("%"):
+            # Env-var reference -- resolved later by ``resolve_env_var``.
+            continue
+        host = _extract_host(url)
+        if host:
+            hosts.add(host)
+    return hosts
+
+
+# ---------------------------------------------------------------------------
 # Per-session sandbox management
 #
 # The Hyperlight WasmSandbox is !Send (not thread-safe and cannot cross
@@ -307,7 +519,7 @@ _SHUTDOWN = object()
 
 # Request queue: each item is either _SHUTDOWN or a tuple of
 # (session_id, code, allowed_domains, heap_size, stack_size,
-#  filesystem_mode, Future).
+#  filesystem_mode, credentials, Future).
 _request_queue: queue.Queue = queue.Queue()
 
 # Maximum code payload size (10 MiB) — defence-in-depth matching
@@ -340,6 +552,7 @@ def _sandbox_worker() -> None:
             heap_size,
             stack_size,
             filesystem_mode,
+            credentials,
             fut,
         ) = item
         try:
@@ -412,16 +625,55 @@ def _sandbox_worker() -> None:
                         methods or "ALL",
                     )
 
+                # Scoped credentials.  The upstream API requires
+                # ``register_credential`` to be called before the first
+                # ``run()``; doing it here -- after ``allow_domain`` and
+                # before the warmup ``run("None")`` -- gives the guest
+                # both gates active by the time any agent code runs.
+                #
+                # Token values are fetched on the worker thread
+                # (per design Q3: "lazily at session boot") so the
+                # latency is paid on the FIRST execute_python call in a
+                # session, not at app startup -- and a transient IMDS
+                # outage at deploy time is recoverable on the next
+                # request, not a hard boot failure.
+                #
+                # The literal token never crosses the host -> guest
+                # boundary as guest-runnable bytes: it is fed via the
+                # WIT-typed ``resolver`` argument that the guest reads
+                # by *id* only (threat-model P1).
+                for spec in credentials:
+                    token = resolve_credential(
+                        spec.parsed_source,
+                        resource=spec.resource,
+                    )
+                    sandbox.register_credential(
+                        spec.id,
+                        target=spec.target,
+                        header=spec.header,
+                        prefix=spec.prefix,
+                        resolver=token,
+                    )
+                    logging.info(
+                        "execution_sandbox: registered credential id=%s"
+                        " target=%s header=%s (token redacted)",
+                        spec.id,
+                        spec.target,
+                        spec.header,
+                    )
+
                 # Warm up the sandbox runtime (first run triggers init)
                 sandbox.run("None")
                 sandboxes[session_id] = sandbox
                 logging.info(
                     "execution_sandbox: created sandbox for session %s "
-                    "(heap=%s, stack=%s, domains=%d, filesystem=%s)",
+                    "(heap=%s, stack=%s, domains=%d, credentials=%d,"
+                    " filesystem=%s)",
                     session_id,
                     heap_size or "default",
                     stack_size or "default",
                     len(allowed_domains),
+                    len(credentials),
                     filesystem_mode,
                 )
 
@@ -521,10 +773,20 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
     stack_size = config.get("stack_size")
     filesystem_mode = _normalize_filesystem_mode(config.get("filesystem"))
 
+    # Credentials parsed at app-startup time so misconfigured agent.md
+    # files fail loud here rather than at first-invocation.  The
+    # per-host cross-check below relies on allowed_domains having
+    # already been normalized into the {url, methods} dict shape.
+    credentials = _parse_credentials(
+        config.get("credentials"),
+        _allowed_domain_hosts(allowed_domains),
+    )
+
     logging.info(
-        "execution_sandbox: creating tool (domains=%d, heap=%s, stack=%s,"
-        " filesystem=%s)",
+        "execution_sandbox: creating tool (domains=%d, credentials=%d,"
+        " heap=%s, stack=%s, filesystem=%s)",
         len(allowed_domains),
+        len(credentials),
         heap_size or "default",
         stack_size or "default",
         filesystem_mode,
@@ -574,6 +836,7 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
                     heap_size,
                     stack_size,
                     filesystem_mode,
+                    credentials,
                     fut,
                 )
             )
