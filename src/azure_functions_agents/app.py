@@ -179,11 +179,16 @@ def _register_triggered_agents(app: func.FunctionApp, app_root: Path) -> None:
         if isinstance(agent_connections, list):
             configure_connector_tools(agent_connections)
 
-        # Per-agent sandbox tools
-        agent_sandbox_tools = []
+        # Per-agent sandbox tools.  Every agent gets a sandbox -- the
+        # ``execution_sandbox`` block in the agent's frontmatter only
+        # *customises* it (allowed domains, credentials, heap size,
+        # filesystem mode, ...).  Agents that omit the block get a
+        # default-policy sandbox with no outbound network and a
+        # read-only ``/input`` mount.
         agent_sandbox = metadata.get("execution_sandbox")
-        if isinstance(agent_sandbox, dict):
-            agent_sandbox_tools = create_sandbox_tools(agent_sandbox)
+        agent_sandbox_tools = create_sandbox_tools(
+            agent_sandbox if isinstance(agent_sandbox, dict) else {}
+        )
 
         # Determine if this is a built-in trigger or connector trigger
         # Dot notation routes to the connectors library (e.g. "teams.new_channel_message_trigger").
@@ -566,9 +571,12 @@ def create_function_app(app_root: Path | None = None) -> func.FunctionApp:
             configure_connector_tools(tools_from_connections)
 
         # ---- Configure execution sandbox from main agent frontmatter ----
+        # As above: the sandbox is always present, the frontmatter just
+        # customises it.
         execution_sandbox = metadata.get("execution_sandbox")
-        if isinstance(execution_sandbox, dict):
-            main_sandbox_tools = create_sandbox_tools(execution_sandbox)
+        main_sandbox_tools = create_sandbox_tools(
+            execution_sandbox if isinstance(execution_sandbox, dict) else {}
+        )
     else:
         logging.info("No main.agent.md found — HTTP chat, MCP, and UI endpoints will return 404.")
 

@@ -4,7 +4,7 @@ These helpers describe the **host-side** filesystem layout that the
 function-app process sees: the bind-mount targets exposed to the
 Hyperlight sandbox as ``/input`` and ``/output``, and the temp directory
 the Copilot CLI is redirected to so its large tool outputs land where
-both the host-side file tools and the sandbox guest can read them.
+the sandbox guest can read them via ``/input/tmp/``.
 
 The values they return are consumed by Linux processes (the sandbox
 guest, the CLI's Node runtime running inside a Linux container) and

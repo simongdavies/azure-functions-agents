@@ -17,10 +17,12 @@ useful either way.
 """
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Dict, Iterable
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _PKG_DIR = _REPO_ROOT / "src" / "azure_functions_agents"
@@ -74,3 +76,45 @@ def load_package_in_isolation(
     sys.modules[package_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def load_modules_under_synthetic_package(
+    package_name: str, modules: Iterable[str]
+) -> Dict[str, ModuleType]:
+    """Load top-level modules under a synthetic parent package.
+
+    Creates an empty parent module called ``package_name`` (whose
+    ``__init__`` is *not* executed -- we never read the real
+    ``azure_functions_agents/__init__.py``) and loads each requested
+    module under it from ``src/azure_functions_agents/<name>.py``.
+
+    Modules are loaded in the order given so each subsequent load can
+    satisfy a ``from .X import ...`` referencing an earlier one.
+    Returns a ``{name: module}`` dict for convenience; the modules are
+    also registered in ``sys.modules`` under both ``name`` and
+    ``package_name.name``.
+
+    Use this when a module to be tested uses relative imports (so it
+    needs a parent package) but the package's real ``__init__.py``
+    pulls in heavy third-party deps we want to avoid.
+    """
+    parent_spec = importlib.machinery.ModuleSpec(
+        package_name, loader=None, is_package=True
+    )
+    parent_spec.submodule_search_locations = [str(_PKG_DIR)]
+    parent = importlib.util.module_from_spec(parent_spec)
+    sys.modules[package_name] = parent
+
+    loaded: Dict[str, ModuleType] = {}
+    for mod_name in modules:
+        full_name = f"{package_name}.{mod_name}"
+        path = _PKG_DIR / f"{mod_name}.py"
+        spec = importlib.util.spec_from_file_location(full_name, path)
+        if spec is None or spec.loader is None:  # pragma: no cover
+            raise RuntimeError(f"Could not build import spec for {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[full_name] = module
+        setattr(parent, mod_name, module)
+        spec.loader.exec_module(module)
+        loaded[mod_name] = module
+    return loaded

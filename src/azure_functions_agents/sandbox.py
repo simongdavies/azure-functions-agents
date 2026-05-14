@@ -28,8 +28,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlparse
 
+from copilot import define_tool
 from copilot.tools import Tool, ToolInvocation, ToolResult
 from hyperlight_sandbox import Sandbox
+from pydantic import BaseModel, Field
 
 from .config import (
     get_agent_input_dir,
@@ -43,6 +45,16 @@ from .credentials import (
     parse_source,
     resolve as resolve_credential,
     validate_id as validate_credential_id,
+)
+from .file_tools import (
+    PathTranslationError,
+    build_grep_snippet,
+    build_head_snippet,
+    build_jq_snippet,
+    build_tail_snippet,
+    build_view_snippet,
+    parse_snippet_result,
+    translate_to_guest_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -96,8 +108,8 @@ _EXECUTE_PYTHON_BASE_DESCRIPTION = (
     "- To print or format text you already have — respond directly with"
     " text instead.\n"
     "- For quick peeks at a file — the view, head, tail, grep, and jq"
-    " tools operate directly on the host filesystem and are cheaper than"
-    " spinning up the sandbox.\n"
+    " tools dispatch a small snippet into this same sandbox and are"
+    " cheaper than writing the full execute_python call yourself.\n"
     "\n"
     "Key behaviours:\n"
     "- State persists across calls within the same conversation:"
@@ -135,10 +147,11 @@ _FILESYSTEM_DESCRIPTION_READ_ONLY = (
     " keep them out of the model context. The CLI reports these on the"
     " host as '{host_tmp}/<file>'. Inside this sandbox the same files"
     " are visible at '/input/tmp/<file>'.\n"
-    "- For quick scans of a large CLI output, prefer the view, head,"
-    " tail, grep, or jq tools (they run directly on the host filesystem"
-    " against '{host_tmp}/<file>' — no sandbox roundtrip)."
-    " Reach for execute_python when you need to compute over the data.\n"
+    "- For quick scans of a parked tool output, the view, head, tail,"
+    " grep, and jq tools accept either the host path the CLI reported"
+    " or the in-sandbox '/input/tmp/<file>' form; they dispatch a small"
+    " snippet into this same sandbox.  Use them for navigation and"
+    " reach for execute_python when you need to compute over the data.\n"
     "- Writes to '/input' will fail; this configuration has no writable"
     " scratch directory.\n"
     "- Example: ``with open('/input/data.csv') as f: rows = f.read()``\n"
@@ -152,9 +165,10 @@ _FILESYSTEM_DESCRIPTION_READ_WRITE = (
     "- '/input/tmp/' is where the Copilot CLI parks large tool outputs to"
     " keep them out of the model context. The CLI reports these on the"
     " host as '{host_tmp}/<file>'. Inside this sandbox the same files"
-    " are visible at '/input/tmp/<file>'. For quick scans, prefer view /"
-    " head / tail / grep / jq on the host path; reach for execute_python"
-    " only when you actually need to compute over the data.\n"
+    " are visible at '/input/tmp/<file>'. The view / head / tail / grep"
+    " / jq tools accept either form and dispatch into this same sandbox;"
+    " use them for navigation and reach for execute_python only when"
+    " you need to compute over the data.\n"
     "- '/output' is a writable directory backed by a real host directory."
     " Files you create there persist across calls, across turns within a"
     " conversation, and (when the operator bind-mounts the directory)"
@@ -185,6 +199,98 @@ def _build_tool_description(filesystem_mode: str) -> str:
         _EXECUTE_PYTHON_BASE_DESCRIPTION
         + _FILESYSTEM_DESCRIPTION_READ_ONLY.format(host_tmp=host_tmp)
     )
+
+
+# ---------------------------------------------------------------------------
+# File-tool parameter models
+#
+# Defined at module scope (not inside ``create_sandbox_tools``) because
+# ``@define_tool`` reads the parameter type via ``get_type_hints``, which
+# fails for classes defined inside closures when
+# ``from __future__ import annotations`` is in effect.
+# ---------------------------------------------------------------------------
+
+
+class _SandboxViewParams(BaseModel):
+    path: str = Field(
+        description=(
+            "Absolute path to the file. Accepts either an in-sandbox path"
+            " (e.g. '/input/tmp/foo.json') or the host path the Copilot"
+            " CLI reported for parked tool outputs (e.g."
+            " '/sandbox/in/tmp/foo.json'); both are translated to the"
+            " same in-sandbox location."
+        ),
+    )
+    start_line: Optional[int] = Field(
+        default=None,
+        description=(
+            "1-based start line. If omitted, reads from the beginning."
+        ),
+    )
+    end_line: Optional[int] = Field(
+        default=None,
+        description=(
+            "1-based end line (inclusive). If omitted, reads to the end."
+        ),
+    )
+
+
+class _SandboxHeadParams(BaseModel):
+    path: str = Field(description="Absolute path to the file.")
+    lines: Optional[int] = Field(
+        default=10,
+        description=(
+            "Number of lines to return from the start (default 10)."
+        ),
+    )
+
+
+class _SandboxTailParams(BaseModel):
+    path: str = Field(description="Absolute path to the file.")
+    lines: Optional[int] = Field(
+        default=10,
+        description=(
+            "Number of lines to return from the end (default 10)."
+        ),
+    )
+
+
+class _SandboxGrepParams(BaseModel):
+    path: str = Field(description="Absolute path to the file to search.")
+    pattern: str = Field(description="Search pattern (plain text or regex).")
+    is_regex: Optional[bool] = Field(
+        default=False,
+        description="Treat pattern as a regex (default: plain text).",
+    )
+    ignore_case: Optional[bool] = Field(
+        default=True,
+        description="Case-insensitive search (default: true).",
+    )
+    max_results: Optional[int] = Field(
+        default=50,
+        description=(
+            "Maximum number of matching lines to return (default 50)."
+        ),
+    )
+
+
+class _SandboxJqParams(BaseModel):
+    path: str = Field(description="Absolute path to a JSON file.")
+    query: str = Field(
+        description=(
+            "Dot-separated path to extract (e.g. '.results',"
+            " '.data.items', '.[0].name'). Use '.' for the entire"
+            " document."
+        ),
+    )
+    max_items: Optional[int] = Field(
+        default=20,
+        description=(
+            "If the result is an array, return at most this many items"
+            " (default 20)."
+        ),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -803,6 +909,32 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
         filesystem_mode,
     )
 
+    async def _dispatch_to_sandbox(session_id: str, code: str) -> str:
+        """Send ``code`` to this agent's sandbox and return the raw envelope.
+
+        Shared by both ``execute_python`` and the file tools.  Returns
+        the JSON-encoded ``{stdout, stderr, exit_code}`` envelope as a
+        string; callers decide how to surface it to the LLM.  Raises any
+        exception the worker thread set on the Future (network errors,
+        sandbox boot failures, etc.).
+        """
+        _ensure_worker_started()
+        fut: concurrent.futures.Future[str] = concurrent.futures.Future()
+        _request_queue.put(
+            (
+                session_id,
+                code,
+                allowed_domains,
+                heap_size,
+                stack_size,
+                filesystem_mode,
+                credentials,
+                fut,
+            )
+        )
+        loop = asyncio.get_running_loop()
+        return await asyncio.wrap_future(fut, loop=loop)
+
     async def _handle_execute_python(invocation: ToolInvocation) -> ToolResult:
         args = invocation.arguments or {}
         code = args.get("code", "")
@@ -832,30 +964,7 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
         )
 
         try:
-            # Ensure the dedicated sandbox worker thread is running
-            _ensure_worker_started()
-
-            # Dispatch to the worker thread via queue and await result.
-            # All sandbox instances live on the worker thread to satisfy
-            # the Rust !Send constraint (WasmSandbox cannot cross threads).
-            fut: concurrent.futures.Future[str] = concurrent.futures.Future()
-            _request_queue.put(
-                (
-                    session_id,
-                    code,
-                    allowed_domains,
-                    heap_size,
-                    stack_size,
-                    filesystem_mode,
-                    credentials,
-                    fut,
-                )
-            )
-
-            # Await without blocking the event loop
-            loop = asyncio.get_running_loop()
-            result_json = await asyncio.wrap_future(fut, loop=loop)
-
+            result_json = await _dispatch_to_sandbox(session_id, code)
             logging.info(
                 "execution_sandbox: session %s completed successfully",
                 session_id,
@@ -875,7 +984,7 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
                 result_type="failure",
             )
 
-    tool = Tool(
+    execute_python_tool = Tool(
         name="execute_python",
         description=_build_tool_description(filesystem_mode),
         parameters={
@@ -891,5 +1000,188 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
         handler=_handle_execute_python,
     )
 
-    logging.info("execution_sandbox: execute_python tool created")
-    return [tool]
+    # -----------------------------------------------------------------
+    # File tools (view / head / tail / grep / jq) -- dispatch a small
+    # Python snippet into the same per-session sandbox.  The wrapping
+    # helper below is intentionally short: it owns path translation,
+    # snippet build error handling, and envelope decoding so every tool
+    # body stays a one-liner.
+    # -----------------------------------------------------------------
+
+    async def _run_file_tool(
+        tool_name: str,
+        invocation: ToolInvocation,
+        snippet_builder,
+        snippet_kwargs: Dict[str, Any],
+    ) -> ToolResult:
+        # Path translation is the security boundary: if it refuses the
+        # path, the LLM gets a clean error and the sandbox is never
+        # asked to open anything outside the mount roots.
+        path = snippet_kwargs.pop("path")
+        try:
+            guest_path = translate_to_guest_path(path)
+        except PathTranslationError as exc:
+            return ToolResult(
+                text_result_for_llm=json.dumps({"error": str(exc)}),
+                result_type="failure",
+            )
+
+        snippet = snippet_builder(path=guest_path, **snippet_kwargs)
+        session_id = invocation.session_id or "default"
+        logging.info(
+            "execution_sandbox: %s on '%s' in session %s",
+            tool_name,
+            guest_path,
+            session_id,
+        )
+
+        try:
+            envelope = await _dispatch_to_sandbox(session_id, snippet)
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            logging.error(
+                "execution_sandbox: %s failed in session %s: %s",
+                tool_name,
+                session_id,
+                err,
+            )
+            return ToolResult(
+                text_result_for_llm=json.dumps({"error": err}),
+                result_type="failure",
+            )
+
+        ok, payload = parse_snippet_result(envelope)
+        return ToolResult(
+            text_result_for_llm=json.dumps(payload),
+            result_type="success" if ok else "failure",
+        )
+
+    async def _view_handler(
+        params: _SandboxViewParams, invocation: ToolInvocation
+    ) -> ToolResult:
+        return await _run_file_tool(
+            "view",
+            invocation,
+            build_view_snippet,
+            {
+                "path": params.path,
+                "start_line": params.start_line,
+                "end_line": params.end_line,
+            },
+        )
+
+    async def _head_handler(
+        params: _SandboxHeadParams, invocation: ToolInvocation
+    ) -> ToolResult:
+        return await _run_file_tool(
+            "head",
+            invocation,
+            build_head_snippet,
+            {"path": params.path, "lines": params.lines},
+        )
+
+    async def _tail_handler(
+        params: _SandboxTailParams, invocation: ToolInvocation
+    ) -> ToolResult:
+        return await _run_file_tool(
+            "tail",
+            invocation,
+            build_tail_snippet,
+            {"path": params.path, "lines": params.lines},
+        )
+
+    async def _grep_handler(
+        params: _SandboxGrepParams, invocation: ToolInvocation
+    ) -> ToolResult:
+        return await _run_file_tool(
+            "grep",
+            invocation,
+            build_grep_snippet,
+            {
+                "path": params.path,
+                "pattern": params.pattern,
+                "is_regex": bool(params.is_regex),
+                "ignore_case": bool(params.ignore_case),
+                "max_results": params.max_results,
+            },
+        )
+
+    async def _jq_handler(
+        params: _SandboxJqParams, invocation: ToolInvocation
+    ) -> ToolResult:
+        return await _run_file_tool(
+            "jq",
+            invocation,
+            build_jq_snippet,
+            {
+                "path": params.path,
+                "query": params.query,
+                "max_items": params.max_items,
+            },
+        )
+
+    view_tool = define_tool(
+        "view",
+        description=(
+            "View a file in the sandbox by path. Use start_line / end_line"
+            " to read specific sections. Accepts either an in-sandbox path"
+            " (e.g. '/input/tmp/foo.json') or the host-side path the"
+            " Copilot CLI reported for parked tool outputs (e.g."
+            " '/sandbox/in/tmp/foo.json'); both resolve to the same"
+            " file via the sandbox's '/input' or '/output' mount."
+        ),
+        overrides_built_in_tool=True,
+    )(_view_handler)
+
+    head_tool = define_tool(
+        "head",
+        description=(
+            "Show the first N lines of a file in the sandbox (default 10)."
+            " Accepts in-sandbox paths or the host paths the CLI reported"
+            " for parked tool outputs."
+        ),
+    )(_head_handler)
+
+    tail_tool = define_tool(
+        "tail",
+        description=(
+            "Show the last N lines of a file in the sandbox (default 10)."
+            " Accepts in-sandbox paths or the host paths the CLI reported"
+            " for parked tool outputs."
+        ),
+    )(_tail_handler)
+
+    grep_tool = define_tool(
+        "grep",
+        description=(
+            "Search for a pattern in a file in the sandbox. Returns"
+            " matching lines with line numbers. Supports plain text and"
+            " regex patterns. Accepts in-sandbox paths or the host paths"
+            " the CLI reported for parked tool outputs."
+        ),
+        overrides_built_in_tool=True,
+    )(_grep_handler)
+
+    jq_tool = define_tool(
+        "jq",
+        description=(
+            "Query a JSON file in the sandbox using a dot-path expression."
+            " Examples: '.' (entire doc), '.key', '.items.[0].name',"
+            " '.data.results'. Accepts in-sandbox paths or the host paths"
+            " the CLI reported for parked tool outputs."
+        ),
+    )(_jq_handler)
+
+    logging.info(
+        "execution_sandbox: created %d tools (execute_python + view /"
+        " head / tail / grep / jq)",
+        6,
+    )
+    return [
+        execute_python_tool,
+        view_tool,
+        head_tool,
+        tail_tool,
+        grep_tool,
+        jq_tool,
+    ]

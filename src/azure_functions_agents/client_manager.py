@@ -15,12 +15,11 @@ from .config import get_agent_input_tmp_dir, get_app_root, resolve_config_dir
 # model's context window.  When the configured agent input tmp directory
 # (``<AGENT_INPUT_DIR>/tmp``, defaulting to ``/sandbox/in/tmp`` in the
 # basic-chat container) is present we redirect TMPDIR for the subprocess
-# so those files land on the Hyperlight input bind-mount.  The same files
-# are then visible:
-#   - to the host-side view/head/tail/grep/jq tools at
-#     ``<AGENT_INPUT_DIR>/tmp/...``
-#   - to the Hyperlight guest at ``/input/tmp/...``
-# One file on disk, two readers, zero copies.
+# so those files land on the Hyperlight input bind-mount.  The Hyperlight
+# guest then sees the same files at ``/input/tmp/...`` -- one file on
+# disk, one reader (the sandbox), zero copies.  This means execute_python
+# and the view / head / tail / grep / jq tools all reach the parked
+# outputs through the WASI ``/input`` mount instead of the host fs.
 #
 # Note: SubprocessConfig.env REPLACES the inherited environment rather than
 # augmenting it, so we must clone os.environ first.

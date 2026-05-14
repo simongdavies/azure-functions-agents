@@ -103,10 +103,11 @@ def session_exists(config_dir: Optional[str], session_id: str) -> bool:
 #   AGENT_OUTPUT_DIR (default: /sandbox/out) → bind-mount target for /output
 #
 # The CLI temp directory is always derived as ``<input_dir>/tmp`` so the
-# parked tool outputs are visible both to the Hyperlight guest at
-# ``/input/tmp/<file>`` and to the host-side view/head/tail/grep/jq
-# tools at ``<input_dir>/tmp/<file>`` — one file on disk, two readers,
-# zero copies.
+# parked tool outputs land on the same bind-mount the sandbox guest sees
+# at ``/input/tmp/<file>`` — one file on disk, one reader (the sandbox),
+# zero copies.  All file IO from inside an agent (execute_python plus the
+# view / head / tail / grep / jq tools) crosses the sandbox boundary via
+# WASI; the host directories are bind-mount targets only.
 # ---------------------------------------------------------------------------
 
 _DEFAULT_AGENT_INPUT_DIR = "/sandbox/in"
@@ -139,13 +140,13 @@ def get_agent_output_dir() -> str:
 
 
 def get_agent_input_tmp_dir() -> str:
-    """Return ``<input_dir>/tmp`` — where the Copilot CLI parks large outputs.
+    """Return ``<input_dir>/tmp`` -- where the Copilot CLI parks large outputs.
 
-    Both the host-side view/head/tail/grep/jq tools and the Hyperlight
-    guest (at ``/input/tmp``) read these files from this single shared
-    location.  Always derived from :func:`get_agent_input_dir` so the two
-    cannot drift out of sync.  Uses :mod:`posixpath` so the result stays
-    forward-slash on every dev OS.
+    The Hyperlight guest reads these files via the ``/input`` WASI mount
+    at ``/input/tmp/<file>``; the host process only sees them via this
+    bind-mount target.  Always derived from :func:`get_agent_input_dir`
+    so the two cannot drift out of sync.  Uses :mod:`posixpath` so the
+    result stays forward-slash on every dev OS.
     """
     return posixpath.join(get_agent_input_dir(), "tmp")
 
@@ -167,17 +168,17 @@ def check_agent_dirs_at_startup() -> None:
     if not os.path.isdir(input_dir):
         logging.warning(
             "AGENT_INPUT_DIR=%s does not exist. The Copilot CLI's"
-            " temp-redirect, the host-side file tools, and the sandbox"
-            " /input mount will all be unavailable. Create the directory"
-            " (or bind-mount real content) before starting the app.",
+            " temp-redirect and the sandbox /input mount will both be"
+            " unavailable. Create the directory (or bind-mount real"
+            " content) before starting the app.",
             input_dir,
         )
     elif not os.path.isdir(tmp_dir):
         logging.warning(
             "AGENT_INPUT_DIR=%s exists but %s does not. The Copilot CLI"
             " will fall back to the system temp dir, and large tool"
-            " outputs will not be visible to the host-side file tools or"
-            " to the sandbox /input/tmp/.",
+            " outputs will not be visible to the sandbox at"
+            " /input/tmp/.",
             input_dir,
             tmp_dir,
         )
