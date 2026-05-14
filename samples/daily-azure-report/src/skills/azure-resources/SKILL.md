@@ -1,23 +1,29 @@
 ---
 name: azure-resources
-description: Query and manage Azure resources using the ARM REST API via the azure_rest custom tool. Use when listing, filtering, or inspecting Azure resources, resource groups, deployments, or subscription details.
+description: Query and manage Azure resources by calling the ARM REST API from `execute_python` with the `azure_mgmt` scoped credential. Use when listing, filtering, or inspecting Azure resources, resource groups, deployments, or subscription details.
 ---
 
 # Azure Resources
 
-## Tools available
+## How to call ARM
 
-### azure_rest
-A custom tool that makes authenticated requests to the Azure Resource Manager REST API. It uses the function app's managed identity — no tokens or credentials needed.
+You make Azure Resource Manager (ARM) calls from inside `execute_python`. The Hyperlight Wasm guest exposes `http_get` and `http_post` built-ins (no `import` needed). Pass `credential="azure_mgmt"` to attach the managed-identity bearer token — the host injects the `Authorization` header for you, and the guest **never** sees the literal token value.
 
-Parameters:
-- `path` (required) — ARM REST API path relative to `https://management.azure.com`. Must include `api-version` as a query parameter.
-- `method` (optional, default GET) — HTTP method.
-- `body` (optional) — JSON request body for POST/PUT/PATCH.
-- `query` (optional) — JMESPath expression to filter the response, similar to `az --query`. Use this to reduce response size and extract only the fields you need. Examples:
-  - `value[].{name: name, type: type, location: location}` — extract specific fields from a resource list
-  - `value[?type=='Microsoft.Web/sites'].name` — filter by resource type
-  - `value | length(@)` — count results
+```python
+import json
+resp = http_get(
+    "https://management.azure.com/subscriptions/{subscriptionId}/resources"
+    "?api-version=2021-04-01",
+    credential="azure_mgmt",
+)
+data = json.loads(resp["body"])
+```
+
+Notes:
+- Both `http_get(url, credential=...)` and `http_post(url, body=..., content_type=..., credential=...)` accept the `credential` keyword.
+- Returned `resp` is `{"status": int, "body": str}`. Parse the body with `json.loads`.
+- Filter / shape the response with Python comprehensions before printing so the LLM sees only the fields it needs (the JMESPath dance is no longer required).
+- If the call fails the guest will raise — surface the error rather than retrying with a hand-rolled header.
 
 ### Microsoft Learn MCP server
 Use the Microsoft Learn tools (`microsoft_docs_search`, `microsoft_docs_fetch`) to look up correct ARM REST API paths, api-versions, query parameters, and response schemas when you're unsure.
@@ -55,4 +61,5 @@ GET /subscriptions/{subscriptionId}/resourcegroups/{resourceGroupName}/providers
 - The `api-version` query parameter is **required** for all ARM calls. If unsure of the version, search Microsoft Learn.
 - To filter recently changed resources, list all resources and filter client-side by `createdTime` and `changedTime` timestamps (ISO 8601 format).
 - Large subscriptions may return paginated results with a `nextLink` property. Follow it to get additional pages.
-- RBAC on the managed identity controls what the tool can access. Reader role allows listing and reading all resources.
+- RBAC on the managed identity controls what the credential can access. Reader role allows listing and reading all resources; broader changes (POST/PUT/PATCH/DELETE) need a role that grants the corresponding write actions.
+- Sandbox network access is deny-by-default. `management.azure.com` is allowlisted in the agent frontmatter; calls to other hosts will be rejected even when `azure_mgmt` is attached.

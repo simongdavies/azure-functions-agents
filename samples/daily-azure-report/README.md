@@ -4,13 +4,13 @@ A multi-agent Azure Functions app that monitors your Azure subscription. Include
 
 | Trigger | Custom Tools | Connectors | MCP Servers | Skills | Sandbox | Chat UI |
 |---|---|---|---|---|---|---|
-| Timer + HTTP | ✅ azure_rest | ✅ Office 365 | ✅ MS Learn | ✅ azure-resources | | ✅ |
+| Timer + HTTP | | ✅ Office 365 | ✅ MS Learn | ✅ azure-resources | ✅ execute_python + azure_mgmt | ✅ |
 
 ## Features
 
 - **Timer trigger** — `daily_azure_report_agent` runs daily at 15:00 UTC, emails a report of resources created or changed in the last 24 hours
 - **HTTP trigger** — `resource_summary_agent` at `POST /resource-summary` returns a structured JSON summary of all resources by type and location
-- **Custom `azure_rest` tool** — makes authenticated ARM REST API calls using the function app's managed identity, with JMESPath query support
+- **Sandboxed ARM access via `execute_python`** — the agent runs Python in a Hyperlight Wasm sandbox and calls ARM through `http_get(url, credential="azure_mgmt")`. The host fetches the managed-identity token from IMDS and injects the `Authorization` header on outbound requests; the literal token never crosses into the guest as guest-runnable bytes.
 - **Office 365 connector** — sends the report via email
 - **Microsoft Learn MCP server** — gives the agent access to Azure documentation for looking up correct API paths and versions
 - **`azure-resources` skill** — packages ARM REST API knowledge (paths, api-versions, tips) so the agent instructions can focus on the job, not the technical details
@@ -59,7 +59,7 @@ A multi-agent Azure Functions app that monitors your Azure subscription. Include
    - Click **Edit API connection** in the left menu
    - Click **Authorize**, sign in with your Microsoft account, then click **Save**
 
-   The `azure_rest` custom tool uses the function app's managed identity — no manual authentication needed.
+   The sandboxed `execute_python` tool uses the function app's managed identity (via the `azure_mgmt` scoped credential) — no manual authentication needed.
 
 4. **Verify:**
 
@@ -95,8 +95,8 @@ Optional:
 
 Without `SUBSCRIPTION_ID`:
 
-- The `azure_rest` tool cannot authenticate to query Azure resources
-- Both timer and HTTP agents fail
+- The agents have no subscription to query and both fail
+- The `azure_mgmt` credential still resolves (it only depends on IMDS), but calls have nowhere to point
 
 Without `O365_CONNECTION_ID`:
 
@@ -152,13 +152,13 @@ Invoke-WebRequest -Uri "http://localhost:7071/resource-summary" `
 
 ### Shared capabilities
 
-- [`tools/azure_rest.py`](src/tools/azure_rest.py) — custom tool for authenticated ARM REST API calls with JMESPath query filtering
+- **`execution_sandbox` frontmatter** on each agent — declares `allowed_domains: "management.azure.com,..."` plus a `credentials:` entry binding `azure_mgmt -> azure_imds`. The framework resolves the IMDS token on the host and registers it with the Hyperlight Wasm sandbox so the guest can call ARM without ever seeing the literal bearer.
 - [`mcp.json`](src/mcp.json) — Microsoft Learn MCP server for Azure documentation lookups
-- [`skills/azure-resources/SKILL.md`](src/skills/azure-resources/SKILL.md) — ARM REST API knowledge (paths, api-versions, tips)
+- [`skills/azure-resources/SKILL.md`](src/skills/azure-resources/SKILL.md) — ARM REST API knowledge (paths, api-versions, tips) phrased around `http_get(url, credential="azure_mgmt")`
 - The `tools_from_connections` frontmatter references the Office 365 API Connection for sending email
 - When the timer fires, the agent:
-  1. Calls the `azure_rest` tool to list resources in the subscription
-  2. Filters for resources created or modified in the last 24 hours
+  1. Calls `execute_python` to fetch the subscription's resource list via `http_get(..., credential="azure_mgmt")` and filter it in-sandbox
+  2. Receives the filtered JSON back in the conversation
   3. Formats a summary report as an HTML email
   4. Sends the report to the configured recipient via the Office 365 connector
 - The HTTP agent at `/resource-summary` accepts a JSON body with `subscription_id` and returns a structured summary:

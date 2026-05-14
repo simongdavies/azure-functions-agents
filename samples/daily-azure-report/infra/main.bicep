@@ -159,7 +159,10 @@ module connectorRbac './app/connector-rbac.bicep' = {
   }
 }
 
-// RBAC — Reader on subscription for azure_rest custom tool
+// RBAC — Reader on subscription for the sandbox-side ARM calls. Each agent's
+// `execution_sandbox.credentials.azure_mgmt` source is `azure_imds`, so the
+// host fetches a bearer token from IMDS using THIS managed identity. The
+// token's effective permissions == the role assignments granted here.
 resource subscriptionReaderRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(subscription().id, functionAppName, readerRoleId)
   properties: {
