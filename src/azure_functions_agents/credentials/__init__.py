@@ -14,10 +14,15 @@ change and review (PR) -- never a docs recipe.
 
 v1 source types (frozen):
 
-* ``azure_imds`` -- Azure Instance Metadata Service token endpoint
-  (raw urllib + ``Metadata: true`` header, no azure-identity dep at
-  the resolver tier).  Requires the ``resource`` field on the
-  frontmatter entry.
+* ``azure_imds`` -- Azure managed-identity token, fetched via whichever
+  platform endpoint is exposed to the host process: the link-local
+  IMDS endpoint (VMs / VMSS / AKS / ACI) *or* the per-instance App
+  Service MSI endpoint (Functions / App Service / Container Apps,
+  signalled by the ``IDENTITY_ENDPOINT`` + ``IDENTITY_HEADER`` env
+  vars).  Raw urllib at the resolver tier -- no ``azure-identity``
+  dependency.  Requires the ``resource`` field on the frontmatter
+  entry.  The source-type name reflects the resolver file's history,
+  not its current scope; existing samples don't need to change.
 * ``env:VAR_NAME`` -- value of the named environment variable.
   ``VAR_NAME`` must be a POSIX-style identifier.
 
