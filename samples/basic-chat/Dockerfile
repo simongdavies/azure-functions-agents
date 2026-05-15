@@ -33,11 +33,16 @@
 FROM python:3.11-bookworm
 
 # --- Install Node.js (for Azurite) + Azure Functions Core Tools v4 ---------
+# clang/lld are also required by the hyperlight-sandbox-backend-wasm build
+# (the hyperlight-guest-bin crate's build script invokes ``clang`` via
+# ``cc-rs`` to compile the WASM-runtime guest stub).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         curl \
         gnupg \
         apt-transport-https \
+        clang \
+        lld \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && curl -sL https://packages.microsoft.com/keys/microsoft.asc | \
