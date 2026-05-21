@@ -17,15 +17,17 @@ dependencies = [
     "azurefunctions-extensions-http-fastapi",
     "aiohttp>=3.9.0",
     "azure-identity>=1.15.0",
-    # Pinned to commit c86ff7e on simongdavies/hyperlight-sandbox feat/scoped-credentials.
-    # Three direct refs (one per package) because pip resolves `[wasm]` /
-    # `[python_guest]` extras by name against PyPI, and the core package's
-    # `optional-dependencies` field carries no git URL. Revert to a single
+    # Pinned to commit 3c4669f on simongdavies/hyperlight-sandbox feat/scoped-credentials
+    # (rebased onto fix/python-guest-persist-globals so module globals survive
+    # across Sandbox.run() calls -- upstream PR open). Three direct refs (one
+    # per package) because pip resolves `[wasm]` / `[python_guest]` extras by
+    # name against PyPI, and the core package's `optional-dependencies` field
+    # carries no git URL. Revert to a single
     # `hyperlight-sandbox[wasm,python_guest]>=X` line once the fork lands
     # upstream and a release is published.
-    "hyperlight-sandbox @ git+https://github.com/simongdavies/hyperlight-sandbox.git@c86ff7e7ad123e181b8740a54a3d84eeb18763e8#subdirectory=src/sdk/python/core",
-    "hyperlight-sandbox-backend-wasm @ git+https://github.com/simongdavies/hyperlight-sandbox.git@c86ff7e7ad123e181b8740a54a3d84eeb18763e8#subdirectory=src/sdk/python/wasm_backend",
-    "hyperlight-sandbox-python-guest @ git+https://github.com/simongdavies/hyperlight-sandbox.git@c86ff7e7ad123e181b8740a54a3d84eeb18763e8#subdirectory=src/sdk/python/wasm_guests/python_guest",
+    "hyperlight-sandbox @ git+https://github.com/simongdavies/hyperlight-sandbox.git@3c4669f#subdirectory=src/sdk/python/core",
+    "hyperlight-sandbox-backend-wasm @ git+https://github.com/simongdavies/hyperlight-sandbox.git@3c4669f#subdirectory=src/sdk/python/wasm_backend",
+    "hyperlight-sandbox-python-guest @ git+https://github.com/simongdavies/hyperlight-sandbox.git@3c4669f#subdirectory=src/sdk/python/wasm_guests/python_guest",
 ]
 
 [project.optional-dependencies]

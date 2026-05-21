@@ -5,8 +5,8 @@
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "PYTHON_ENABLE_INIT_INDEXING": "1",
     "GITHUB_TOKEN": "",
-    "SUBSCRIPTION_ID": "",
-    "O365_CONNECTION_ID": "",
-    "TO_EMAIL": ""
+    "AGENT_SUBSCRIPTION_ID": "",
+    "AGENT_O365_CONNECTION_ID": "",
+    "AGENT_TO_EMAIL": ""
   }
 }

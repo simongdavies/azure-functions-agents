@@ -4,7 +4,7 @@ Each subdirectory is a standalone Azure Functions app deployable with [`azd up`]
 
 | Sample | Trigger | Custom Tools | Connectors | MCP Servers | Skills | Sandbox | Chat UI |
 |---|---|---|---|---|---|---|---|
-| [basic-chat](basic-chat/) | HTTP | | | | | ✅ | ✅ |
+| [basic-chat](basic-chat/) | HTTP | ✅ word_count | | | | ✅ | ✅ |
 | [daily-tech-news-email](daily-tech-news-email/) | Timer | | ✅ Office 365 | | | ✅ | |
 | [daily-azure-report](daily-azure-report/) | Timer + HTTP | | ✅ Office 365 | ✅ MS Learn | ✅ azure-resources | ✅ execute_python + azure_mgmt | ✅ |
 

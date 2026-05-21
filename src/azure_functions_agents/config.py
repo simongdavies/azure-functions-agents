@@ -192,6 +192,55 @@ def check_agent_dirs_at_startup() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Developer env-var allow-list
+# ---------------------------------------------------------------------------
+#
+# Developer-supplied content (agent.md frontmatter and body text)
+# may reference environment variables via ``$VAR`` / ``%VAR%``
+# substitution.  Under the framework's threat model the developer is
+# adversarial: a developer who can ask the host to dereference
+# ``$AZUREWEBJOBSSTORAGE``, ``$IDENTITY_HEADER``, ``$GITHUB_TOKEN``
+# etc. can exfiltrate framework / platform secrets via the rendered
+# prompt that ships to the LLM.
+#
+# Mitigation: dereferencing is gated on a **build-time-baked name
+# prefix**.  Only env vars whose name starts with the prefix are
+# dereferenceable from developer content; every other name passes
+# through verbatim (the ``$X`` reference is preserved unchanged).
+# Framework code that legitimately needs to read its own env vars
+# does so directly via ``os.environ.get(…)`` and is not affected
+# by this gate.
+#
+# Silent fail-closed: we deliberately do NOT raise on a rejected
+# name.  A loud failure would let the developer probe the allow-list
+# via error messages and timing; literal-passthrough is the same
+# observable behaviour as "env var unset", so the developer cannot
+# distinguish "forbidden" from "unbound" — exactly the
+# information-hiding we want.
+#
+# This constant is duplicated in
+# ``azure_functions_agents.credentials.__init__`` (which enforces the
+# same rule for ``source: env:VAR`` credential references) and MUST
+# be kept in sync; both sites are independently loaded in isolation
+# by the test infrastructure, so they cannot share a module without
+# breaking that.
+# ---------------------------------------------------------------------------
+
+_AGENT_ENV_PREFIX = "AGENT_"
+
+
+def _is_agent_env_var(name: str) -> bool:
+    """Return ``True`` if ``name`` is dereferenceable from developer content.
+
+    Only names with the :data:`_AGENT_ENV_PREFIX` prefix are
+    accessible via :func:`resolve_env_var` and
+    :func:`substitute_env_vars_in_text`.  See the section comment
+    above for the threat-model rationale.
+    """
+    return name.startswith(_AGENT_ENV_PREFIX)
+
+
+# ---------------------------------------------------------------------------
 # Environment variable substitution for agent frontmatter values
 # ---------------------------------------------------------------------------
 
@@ -207,6 +256,12 @@ def resolve_env_var(value: str) -> str:
 
       - ``%VAR_NAME%`` — value is entirely ``%…%``
       - ``$VAR_NAME``  — value is entirely ``$IDENT``
+
+    Allow-list gate: only env vars whose name starts with
+    :data:`_AGENT_ENV_PREFIX` are dereferenceable.  Non-prefixed
+    names are silently rejected (the original ``$X`` / ``%X%`` text
+    is returned unchanged) — see the section comment above for the
+    threat-model rationale.
 
     If the value does not match either pattern, or the referenced
     environment variable is not set, the original string is returned
@@ -227,7 +282,10 @@ def resolve_env_var(value: str) -> str:
     stripped = value.strip()
     m = _PERCENT_PATTERN.match(stripped) or _DOLLAR_PATTERN.match(stripped)
     if m:
-        return os.environ.get(m.group(1), value)
+        name = m.group(1)
+        if not _is_agent_env_var(name):
+            return value
+        return os.environ.get(name, value)
     return value
 
 
@@ -266,21 +324,33 @@ def substitute_env_vars_in_text(text: str) -> str:
 
     Supported syntaxes:
 
-      - ``$VAR_NAME``  — e.g. ``send mail to $TO_EMAIL``
-      - ``%VAR_NAME%`` — e.g. ``post to the %TEAM_NAME% team``
+      - ``$VAR_NAME``  — e.g. ``send mail to $AGENT_TO_EMAIL``
+      - ``%VAR_NAME%`` — e.g. ``post to the %AGENT_TEAM_NAME% team``
 
-    If the referenced environment variable is not set, the original
-    reference is left unchanged (fail-open).
+    Allow-list gate: only env vars whose name starts with
+    :data:`_AGENT_ENV_PREFIX` are dereferenceable.  Non-prefixed
+    names are silently rejected (the original ``$X`` / ``%X%`` text
+    passes through verbatim) — see the section comment near
+    :data:`_AGENT_ENV_PREFIX` for the threat-model rationale.
+
+    If a referenced (and allow-listed) environment variable is not
+    set, the original reference is left unchanged.
 
     Text inside fenced code blocks (``````...``````) is left untouched
     so that documentation examples are not accidentally altered.
     """
 
     def _dollar_replacer(m: re.Match) -> str:
-        return os.environ.get(m.group(1), m.group(0))
+        name = m.group(1)
+        if not _is_agent_env_var(name):
+            return m.group(0)
+        return os.environ.get(name, m.group(0))
 
     def _percent_replacer(m: re.Match) -> str:
-        return os.environ.get(m.group(1), m.group(0))
+        name = m.group(1)
+        if not _is_agent_env_var(name):
+            return m.group(0)
+        return os.environ.get(name, m.group(0))
 
     def _substitute(segment: str) -> str:
         segment = _INLINE_DOLLAR_PATTERN.sub(_dollar_replacer, segment)

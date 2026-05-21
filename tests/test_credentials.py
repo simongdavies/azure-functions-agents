@@ -60,10 +60,10 @@ def test_parse_source_azure_imds_returns_imds_kind() -> None:
 
 
 def test_parse_source_env_prefix_extracts_var_name() -> None:
-    parsed = credentials.parse_source("env:GITHUB_TOKEN")
+    parsed = credentials.parse_source("env:AGENT_GITHUB_TOKEN")
 
     assert parsed.kind == credentials.KIND_ENV
-    assert parsed.env_var == "GITHUB_TOKEN"
+    assert parsed.env_var == "AGENT_GITHUB_TOKEN"
 
 
 def test_parse_source_unknown_kind_raises_value_error() -> None:
@@ -76,6 +76,36 @@ def test_parse_source_env_invalid_name_raises_value_error() -> None:
     """POSIX env-var rule: identifier must not start with a digit."""
     with pytest.raises(ValueError, match="not a valid env-var name"):
         credentials.parse_source("env:1invalid")
+
+
+def test_parse_source_env_unprefixed_name_raises_value_error() -> None:
+    """Developer-named env vars must carry the framework's allow-list prefix.
+
+    Without this gate a developer can write ``source: env:GITHUB_TOKEN``
+    (or ``IDENTITY_HEADER``, ``AzureWebJobsStorage``, ...) and silently
+    steal framework / platform secrets via the Authorization header
+    of arbitrary outbound calls.  The parse-time gate refuses any
+    name that does not start with :data:`_AGENT_ENV_PREFIX`.
+    """
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"credentials: source 'env:GITHUB_TOKEN' is not allow-listed"
+        ),
+    ):
+        credentials.parse_source("env:GITHUB_TOKEN")
+
+
+def test_parse_source_env_lowercase_prefix_rejected() -> None:
+    """The prefix is case-sensitive ('AGENT_'), not 'agent_'.
+
+    POSIX env vars are case-sensitive and convention is uppercase;
+    accepting lowercase here would let a developer slip past the
+    allow-list with names that look unrelated (e.g.
+    ``agent_my_var`` evades a grep for ``AGENT_``).
+    """
+    with pytest.raises(ValueError, match="not allow-listed"):
+        credentials.parse_source("env:agent_my_var")
 
 
 def test_parse_source_non_string_raises_value_error() -> None:
@@ -110,6 +140,133 @@ def test_validate_id_rejects_dots() -> None:
 def test_validate_id_rejects_non_string() -> None:
     with pytest.raises(ValueError, match="must be a string"):
         credentials.validate_id(123)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# extract_host -- hostname extraction helper
+# ---------------------------------------------------------------------------
+
+
+def test_extract_host_returns_lowercase_hostname_from_url() -> None:
+    assert (
+        credentials.extract_host("https://Management.Azure.COM/.default")
+        == "management.azure.com"
+    )
+
+
+def test_extract_host_returns_hostname_from_bare_host() -> None:
+    assert (
+        credentials.extract_host("management.azure.com")
+        == "management.azure.com"
+    )
+
+
+def test_extract_host_strips_path_from_bare_host_form() -> None:
+    """A bare ``host/path`` (no scheme) returns just the host."""
+    assert (
+        credentials.extract_host("management.azure.com/subscriptions")
+        == "management.azure.com"
+    )
+
+
+def test_extract_host_returns_empty_when_url_has_no_host() -> None:
+    """``file:///path`` and similar URL forms yield an empty host."""
+    assert credentials.extract_host("file:///etc/passwd") == ""
+
+
+# ---------------------------------------------------------------------------
+# check_imds_audience_target -- MSI audience / target cross-check 
+# ---------------------------------------------------------------------------
+
+
+def test_check_imds_audience_target_accepts_matching_hosts() -> None:
+    """Equal hostnames (the legitimate case) are accepted silently."""
+    credentials.check_imds_audience_target(
+        cred_id="azure_mgmt",
+        resource="https://management.azure.com/.default",
+        target_host="management.azure.com",
+    )
+
+
+def test_check_imds_audience_target_is_case_insensitive_on_resource() -> None:
+    """``Management.Azure.COM`` matches ``management.azure.com`` (RFC1035)."""
+    credentials.check_imds_audience_target(
+        cred_id="azure_mgmt",
+        resource="https://Management.Azure.COM/.default",
+        target_host="management.azure.com",
+    )
+
+
+def test_check_imds_audience_target_rejects_mismatch() -> None:
+    """A resource pointing at vault while target is ARM is rejected.
+
+    This is the confused-deputy attack the check exists to block:
+    fetching a high-value audience token (vault here) and routing it
+    to an unrelated allow-listed host (ARM) so the developer's
+    declared ``target`` doesn't reflect the token's real value.
+    """
+    with pytest.raises(
+        ValueError, match=r"does not match target host 'management\.azure\.com'"
+    ):
+        credentials.check_imds_audience_target(
+            cred_id="azure_mgmt",
+            resource="https://vault.azure.net/.default",
+            target_host="management.azure.com",
+        )
+
+
+def test_check_imds_audience_target_rejects_resource_without_host() -> None:
+    """A resource URL without a host can never authenticate anything.
+
+    The malformed-URL case is rare in real configs (developers usually
+    copy the audience verbatim from docs) but if it does happen we
+    want a parse-time error pointing at the empty-host condition,
+    not a hostname-mismatch error against whatever the URL parser
+    happened to return.
+    """
+    with pytest.raises(ValueError, match="has no host"):
+        credentials.check_imds_audience_target(
+            cred_id="azure_mgmt",
+            resource="file:///etc/passwd",
+            target_host="management.azure.com",
+        )
+
+
+def test_check_imds_audience_target_error_mentions_actionable_fix() -> None:
+    """The error message should suggest the fix (matching pair).
+
+    Operators reading this in deployment logs need to know what to
+    type, not just that "something is wrong".  Pin the suggestion
+    line so we don't silently regress the message.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        credentials.check_imds_audience_target(
+            cred_id="my_cred",
+            resource="https://graph.microsoft.com/.default",
+            target_host="management.azure.com",
+        )
+    msg = str(excinfo.value)
+    assert "resource: 'https://management.azure.com/.default'" in msg
+    assert "target: 'management.azure.com'" in msg
+    assert "my_cred" in msg
+
+
+def test_check_imds_audience_target_rejects_subdomain_mismatch() -> None:
+    """``ne.eastus.kusto.windows.net`` != ``kusto.windows.net`` -- strict match.
+
+    A parent-domain audience is a real Azure pattern (Storage,
+    Service Bus) but it would also let a developer slip a token
+    intended for one tenant's cluster onto another's, so we require
+    exact equality.  Developers who need the parent-domain pattern
+    must use the matching-pair form (resource and target both
+    pointing at the data-plane host).
+    """
+    with pytest.raises(ValueError, match="does not match target host"):
+        credentials.check_imds_audience_target(
+            cred_id="kusto",
+            resource="https://kusto.windows.net/.default",
+            target_host="ne.eastus.kusto.windows.net",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -459,8 +616,8 @@ def test_endpoint_url_with_existing_query_uses_ampersand(
 def test_resolve_env_kind_reads_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("AF_TEST_RESOLVE", "ghp_via_resolve")
-    parsed = credentials.parse_source("env:AF_TEST_RESOLVE")
+    monkeypatch.setenv("AGENT_AF_TEST_RESOLVE", "ghp_via_resolve")
+    parsed = credentials.parse_source("env:AGENT_AF_TEST_RESOLVE")
 
     assert credentials.resolve(parsed, resource=None) == "ghp_via_resolve"
 

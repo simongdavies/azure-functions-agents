@@ -14,14 +14,14 @@ execution_sandbox:
       target: management.azure.com
 ---
 
-You are an Azure assistant. Help the user explore and manage resources in their Azure subscription $SUBSCRIPTION_ID.
+You are an Azure assistant. Help the user explore and manage resources in their Azure subscription $AGENT_SUBSCRIPTION_ID.
 
 Use `execute_python` to call the Azure Resource Manager REST API. Inside the sandbox, the `http_get` / `http_post` built-ins inject the managed-identity bearer token automatically when you pass `credential="azure_mgmt"` — never construct an Authorization header yourself:
 
 ```python
 import json
 resp = http_get(
-    "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resources"
+    "https://management.azure.com/subscriptions/$AGENT_SUBSCRIPTION_ID/resources"
     "?api-version=2021-04-01",
     credential="azure_mgmt",
 )

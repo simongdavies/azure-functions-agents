@@ -28,8 +28,12 @@ from .config import (
     substitute_env_vars_in_text,
 )
 from .connector_tool_cache import configure_connector_tools
+from .frontmatter_schema import FrontmatterError, validate_frontmatter
+from .http_validation import validate_session_id as _validate_session_id
 from .runner import run_copilot_agent, run_copilot_agent_stream
-from .sandbox import create_sandbox_tools
+from .sandbox import create_sandbox_tools, run_discovery_in_sandbox
+from .custom_tools import discover_custom_tools
+from .trigger_validation import validate_trigger_type
 from azurefunctions.extensions.http.fastapi import Request, Response, StreamingResponse
 
 _MCP_AGENT_TOOL_PROPERTIES = json.dumps(
@@ -44,6 +48,10 @@ _MCP_AGENT_TOOL_PROPERTIES = json.dumps(
     ]
 )
 
+# Session-id allow-list see :mod:`.http_validation` for the
+# regex, threat model, and the canonical :func:`_validate_session_id`
+# implementation.  Imported above as ``_validate_session_id``.
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,6 +62,13 @@ def _load_agent_file(path: Path) -> Optional[Dict[str, Any]]:
 
     Returns a dict with 'metadata' (frontmatter dict) and 'content' (body str),
     or None if the file doesn't exist or can't be parsed.
+
+    The metadata dict is validated against the strict schema in
+    :mod:`.frontmatter_schema` *before* being returned -- any unknown
+    top-level key (or unknown key inside ``tools_from_connections``,
+    ``execution_sandbox``, or ``credentials``) causes the file to be
+    rejected with a warning.  See that module's docstring for the
+    threat-model rationale.
     """
     if not path.exists():
         return None
@@ -61,6 +76,17 @@ def _load_agent_file(path: Path) -> Optional[Dict[str, Any]]:
         raw = path.read_text(encoding="utf-8")
         parsed = frontmatter.loads(raw)
         metadata = parsed.metadata if isinstance(parsed.metadata, dict) else {}
+
+        # Strict-schema gate: reject unknown top-level keys so a
+        # developer can't smuggle a new field past code review.
+        try:
+            validate_frontmatter(metadata)
+        except FrontmatterError as exc:
+            logging.warning(
+                f"Rejected {path.name}: frontmatter failed schema validation: {exc}"
+            )
+            return None
+
         content = (parsed.content or "").strip()
 
         # Apply inline env-var substitution unless explicitly disabled
@@ -158,6 +184,16 @@ def _register_triggered_agents(app: func.FunctionApp, app_root: Path) -> None:
         trigger_type = str(trigger_spec["type"]).strip()
         trigger_params = {k: v for k, v in trigger_spec.items() if k != "type"}
 
+        # Refuse developer
+        # frontmatter that names a trigger we haven't audited so a
+        # crafted ``trigger.type`` can't navigate the FunctionApp /
+        # connectors object graph via ``getattr``.
+        try:
+            trigger_kind, canonical_trigger = validate_trigger_type(trigger_type)
+        except ValueError as exc:
+            logging.warning(f"Skipping {agent_path.name}: {exc}")
+            continue
+
         # Resolve env vars on string params
         trigger_params = _resolve_trigger_params(trigger_params)
 
@@ -186,27 +222,39 @@ def _register_triggered_agents(app: func.FunctionApp, app_root: Path) -> None:
         # default-policy sandbox with no outbound network and a
         # read-only ``/input`` mount.
         agent_sandbox = metadata.get("execution_sandbox")
-        agent_sandbox_tools = create_sandbox_tools(
+        agent_sandbox_config = (
             agent_sandbox if isinstance(agent_sandbox, dict) else {}
         )
+        # Developer-supplied tools (``<app_root>/tools/*.py``) are
+        # discovered by parsing the source files INSIDE an ephemeral
+        # Hyperlight sandbox (host never invokes ast.parse on
+        # developer bytes -- see custom_tools.py module docstring).
+        # The accepted modules are then bootstrapped into the
+        # per-session sandbox by ``create_sandbox_tools``.
+        # ``execution_sandbox.tools`` accepts a bare list of module
+        # names; omit it for auto-discovery, set to ``[]`` to opt out.
+        agent_custom_toolset = discover_custom_tools(
+            agent_sandbox_config.get("tools"),
+            sandbox_runner=run_discovery_in_sandbox,
+        )
+        agent_sandbox_tools = create_sandbox_tools(
+            agent_sandbox_config,
+            custom_toolset=agent_custom_toolset,
+        )
 
-        # Determine if this is a built-in trigger or connector trigger
-        # Dot notation routes to the connectors library (e.g. "teams.new_channel_message_trigger").
-        # "connectors." prefix is stripped if present (e.g. "connectors.generic_trigger" → "generic_trigger").
-        is_connector = "." in trigger_type
-        if is_connector:
-            # Strip leading "connectors." prefix if present
-            connector_type = trigger_type.removeprefix("connectors.")
+        if trigger_kind == "connector":
+            # ``canonical_trigger`` already has any "connectors."
+            # prefix stripped by the validator.
             connectors_instance = _register_connector_agent(
                 app, connectors_instance, function_name, agent_name,
-                connector_type, trigger_params, content, should_log,
+                canonical_trigger, trigger_params, content, should_log,
                 sandbox_tools=agent_sandbox_tools,
             )
         else:
             # Built-in Azure Functions trigger
             _register_builtin_agent(
                 app, function_name, agent_name,
-                trigger_type, trigger_params, content, should_log,
+                canonical_trigger, trigger_params, content, should_log,
                 sandbox_tools=agent_sandbox_tools,
                 response_example=metadata.get("response_example"),
                 response_schema=metadata.get("response_schema"),
@@ -531,6 +579,17 @@ def create_function_app(app_root: Path | None = None) -> func.FunctionApp:
         ``tools/``, ``skills/``, etc.).  When *None*, falls back to
         ``COPILOT_APP_ROOT`` env var or the current working directory.
     """
+    # The Azure Functions Python worker detaches stdlib logging from
+    # stdout at startup and routes records through the host's gRPC
+    # logging channel.  Python's root logger still defaults to WARNING
+    # there, which silently drops every ``logging.info(...)`` call in
+    # the framework before it ever reaches the host's
+    # ``host.json`` filter.  Bumping the root level to INFO at
+    # framework startup makes our diagnostics visible end-to-end
+    # (subject to ``logLevel`` in ``host.json``).  Operators can dial
+    # this further via env var if needed.
+    logging.getLogger().setLevel(logging.INFO)
+
     if app_root is not None:
         set_app_root(app_root)
 
@@ -574,8 +633,16 @@ def create_function_app(app_root: Path | None = None) -> func.FunctionApp:
         # As above: the sandbox is always present, the frontmatter just
         # customises it.
         execution_sandbox = metadata.get("execution_sandbox")
-        main_sandbox_tools = create_sandbox_tools(
+        execution_sandbox_config = (
             execution_sandbox if isinstance(execution_sandbox, dict) else {}
+        )
+        main_custom_toolset = discover_custom_tools(
+            execution_sandbox_config.get("tools"),
+            sandbox_runner=run_discovery_in_sandbox,
+        )
+        main_sandbox_tools = create_sandbox_tools(
+            execution_sandbox_config,
+            custom_toolset=main_custom_toolset,
         )
     else:
         logging.info("No main.agent.md found — HTTP chat, MCP, and UI endpoints will return 404.")
@@ -630,7 +697,23 @@ def create_function_app(app_root: Path | None = None) -> func.FunctionApp:
                     media_type="application/json",
                 )
 
-            session_id = req.headers.get("x-ms-session-id")
+            session_id_raw = req.headers.get("x-ms-session-id")
+            try:
+                session_id = _validate_session_id(session_id_raw)
+            except ValueError as exc:
+                # Log the prefix only so a crafted long value cannot
+                # itself dominate the log line; never echo the raw
+                # value into the response (it might be a probe).
+                logging.warning(
+                    "Rejected x-ms-session-id (chat): %s (prefix=%r)",
+                    exc,
+                    (session_id_raw or "")[:16],
+                )
+                return Response(
+                    json.dumps({"error": "Invalid x-ms-session-id header"}),
+                    status_code=400,
+                    media_type="application/json",
+                )
             result = await run_copilot_agent(prompt, session_id=session_id, sandbox_tools=main_sandbox_tools)
 
             response = Response(
@@ -688,7 +771,31 @@ def create_function_app(app_root: Path | None = None) -> func.FunctionApp:
                     yield f"data: {json.dumps({'type': 'error', 'content': 'Missing prompt'})}\n\n"
                 return StreamingResponse(error_gen(), media_type="text/event-stream")
 
-            session_id = req.headers.get("x-ms-session-id")
+            session_id_raw = req.headers.get("x-ms-session-id")
+            try:
+                session_id = _validate_session_id(session_id_raw)
+            except ValueError as exc:
+                logging.warning(
+                    "Rejected x-ms-session-id (chatstream): %s (prefix=%r)",
+                    exc,
+                    (session_id_raw or "")[:16],
+                )
+                async def invalid_session_gen():
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "error",
+                                "content": "Invalid x-ms-session-id header",
+                            }
+                        )
+                        + "\n\n"
+                    )
+                return StreamingResponse(
+                    invalid_session_gen(),
+                    media_type="text/event-stream",
+                    status_code=400,
+                )
             return StreamingResponse(
                 run_copilot_agent_stream(prompt, session_id=session_id, sandbox_tools=main_sandbox_tools),
                 media_type="text/event-stream",
@@ -720,7 +827,20 @@ def create_function_app(app_root: Path | None = None) -> func.FunctionApp:
                 if not isinstance(prompt, str) or not prompt.strip():
                     return json.dumps({"error": "Missing 'prompt'"})
 
-                session_id = _extract_mcp_session_id(payload) if isinstance(payload, dict) else None
+                session_id_raw = (
+                    _extract_mcp_session_id(payload)
+                    if isinstance(payload, dict)
+                    else None
+                )
+                try:
+                    session_id = _validate_session_id(session_id_raw)
+                except ValueError as exc:
+                    logging.warning(
+                        "Rejected MCP sessionId: %s (prefix=%r)",
+                        exc,
+                        (session_id_raw or "")[:16],
+                    )
+                    return json.dumps({"error": "Invalid sessionId"})
 
                 result = await run_copilot_agent(prompt.strip(), session_id=session_id, sandbox_tools=main_sandbox_tools)
 

@@ -7,7 +7,7 @@ trigger:
   schedule: "0 0 7 * * *"
 
 tools_from_connections:
-  - connection_id: $O365_CONNECTION_ID
+  - connection_id: $AGENT_O365_CONNECTION_ID
 
 execution_sandbox:
   # Azure Resource Manager — all REST verbs needed by this agent.
@@ -25,12 +25,12 @@ execution_sandbox:
 
 You are an Azure infrastructure reporting assistant. When triggered, do the following:
 
-1. Use `execute_python` to list all resources in subscription $SUBSCRIPTION_ID via the ARM REST API. Inside the sandbox, the `http_get` built-in injects the Authorization header for you when you pass `credential="azure_mgmt"` — never construct one yourself:
+1. Use `execute_python` to list all resources in subscription $AGENT_SUBSCRIPTION_ID via the ARM REST API. Inside the sandbox, the `http_get` built-in injects the Authorization header for you when you pass `credential="azure_mgmt"` — never construct one yourself:
 
    ```python
    import json
    resp = http_get(
-       "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resources"
+       "https://management.azure.com/subscriptions/$AGENT_SUBSCRIPTION_ID/resources"
        "?api-version=2021-04-01",
        credential="azure_mgmt",
    )
@@ -49,4 +49,4 @@ You are an Azure infrastructure reporting assistant. When triggered, do the foll
    - A summary count at the top (e.g. "3 new, 5 updated").
    - A table of changed resources grouped by resource group.
    - If no changes were found, state that clearly.
-5. Send the report to $TO_EMAIL with the subject "Daily Azure Resource Report" followed by today's date.
+5. Send the report to $AGENT_TO_EMAIL with the subject "Daily Azure Resource Report" followed by today's date.

@@ -32,7 +32,7 @@ A multi-agent Azure Functions app that monitors your Azure subscription. Include
    cd samples/daily-azure-report
    azd init
    azd env set GITHUB_TOKEN <your-github-pat>
-   azd env set TO_EMAIL <recipient@example.com>
+   azd env set AGENT_TO_EMAIL <recipient@example.com>
    ```
 
    Optional:
@@ -85,22 +85,29 @@ Follow the [shared local development guide](../README.md#run-locally) in the sam
 Required:
 
 - `GITHUB_TOKEN` (see shared guide)
-- `SUBSCRIPTION_ID`: Azure subscription ID (for querying resources)
-- `TO_EMAIL`: recipient email address
-- `O365_CONNECTION_ID`: Office 365 connector ID
+- `AGENT_SUBSCRIPTION_ID`: Azure subscription ID (for querying resources)
+- `AGENT_TO_EMAIL`: recipient email address
+- `AGENT_O365_CONNECTION_ID`: Office 365 connector ID
 
 Optional:
 
 - `ACA_SESSION_POOL_ENDPOINT`: if set, enables code execution features; if empty, agents work but lose advanced capabilities
 
-Without `SUBSCRIPTION_ID`:
+Without `AGENT_SUBSCRIPTION_ID`:
 
 - The agents have no subscription to query and both fail
 - The `azure_mgmt` credential still resolves (it only depends on IMDS), but calls have nowhere to point
 
-Without `O365_CONNECTION_ID`:
+Without `AGENT_O365_CONNECTION_ID`:
 
 - The timer agent cannot send the daily report email
+
+> **Note** — env vars referenced from developer-supplied content (agent.md
+> frontmatter and body text) must start with the framework-baked prefix
+> `AGENT_`.  Any name without that prefix is silently ignored at
+> substitution time, so e.g. `$IDENTITY_HEADER` or `$GITHUB_TOKEN` in your
+> prompt body never leaks the host's secrets into the LLM context.  See
+> the [security model](../../README.md#security-model) for the rationale.
 
 ### Testing locally
 
@@ -167,5 +174,5 @@ Invoke-WebRequest -Uri "http://localhost:7071/resource-summary" `
   {"total_resources": 239, "by_type": {...}, "by_location": {...}}
   ```
 
-- `$SUBSCRIPTION_ID` and `$TO_EMAIL` in the agent instructions are replaced with actual values at load time (via environment variable substitution)
-- `SUBSCRIPTION_ID` is automatically set from the deployment subscription — no manual input needed
+- `$AGENT_SUBSCRIPTION_ID` and `$AGENT_TO_EMAIL` in the agent instructions are replaced with actual values at load time (via environment variable substitution)
+- `AGENT_SUBSCRIPTION_ID` is automatically set from the deployment subscription — no manual input needed

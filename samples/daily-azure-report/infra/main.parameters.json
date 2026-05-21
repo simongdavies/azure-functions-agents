@@ -6,6 +6,6 @@
     "location": { "value": "${AZURE_LOCATION}" },
     "githubToken": { "value": "${GITHUB_TOKEN}" },
     "copilotModel": { "value": "${COPILOT_MODEL}" },
-    "toEmail": { "value": "${TO_EMAIL}" }
+    "toEmail": { "value": "${AGENT_TO_EMAIL}" }
   }
 }

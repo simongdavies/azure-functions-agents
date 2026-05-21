@@ -11,11 +11,28 @@ import frontmatter
 from .client_manager import CopilotClientManager, _is_byok_mode
 from .config import get_app_root, resolve_config_dir, session_exists, substitute_env_vars_in_text, _to_bool
 from .connector_tool_cache import get_connector_tools
+from .frontmatter_schema import FrontmatterError, validate_frontmatter
 from .mcp import get_cached_mcp_servers
 from .skills import resolve_session_directory_for_skills
-from .tools import _REGISTERED_TOOLS_CACHE
 
 DEFAULT_TIMEOUT = float(os.environ.get("COPILOT_AGENT_TIMEOUT", "900"))
+
+
+async def _call_sdk(awaitable):
+    """Await an SDK coroutine, signalling the singleton on subprocess death.
+
+    Any exception bubbles up unchanged for the caller's normal error
+    handling, but if the cause is a dead Copilot CLI subprocess
+    (:class:`BrokenPipeError` or the SDK's ``ProcessExitedError``) the
+    singleton is also marked dead via
+    :meth:`CopilotClientManager.report_failure` so the *next* request
+    transparently re-spawns the CLI instead of hitting the same corpse.
+    """
+    try:
+        return await awaitable
+    except Exception as exc:
+        CopilotClientManager.report_failure(exc)
+        raise
 
 
 @dataclass
@@ -44,6 +61,20 @@ def _load_agents_md_content() -> str:
         parsed = frontmatter.loads(raw_content)
         content = (parsed.content or "").strip()
         metadata = parsed.metadata if isinstance(parsed.metadata, dict) else {}
+
+        # Strict-schema gate: reject unknown top-level keys
+        # in ``main.agent.md`` so a developer can't smuggle a hidden
+        # field past code review.  See ``frontmatter_schema`` for the
+        # threat-model rationale.  On failure we log and fall back to
+        # an empty system prompt rather than crashing the whole app.
+        try:
+            validate_frontmatter(metadata)
+        except FrontmatterError as exc:
+            logging.warning(
+                f"Rejected main.agent.md: frontmatter failed schema validation: {exc}"
+            )
+            return ""
+
         metadata_count = len(metadata)
 
         # Apply inline env-var substitution unless explicitly disabled
@@ -64,22 +95,60 @@ _AGENTS_MD_CONTENT_CACHE = _load_agents_md_content()
 
 DEFAULT_MODEL = os.environ.get("COPILOT_MODEL", "claude-opus-4.6")
 
-# Built-in CLI tools to disable for security.
-# These are blocked regardless of whether MCP servers are configured.
-_EXCLUDED_BUILTIN_TOOLS = [
-    # Shell access
+# Built-in CLI tools allow-list.
+#
+# The Copilot SDK ships with a bag of built-in tools (shell, file
+# editing, sub-agent spawning, web fetch, ...) that are appropriate
+# for an interactive developer CLI but NOT for an untrusted-prompt
+# server process.  Historically this list lived as a blocklist
+# (``_EXCLUDED_BUILTIN_TOOLS``), which let any newly-shipped SDK
+# tool flow through by default.
+#
+# The migration flipped the polarity:
+#
+#   1. ``_KNOWN_SDK_BUILTIN_TOOLS`` is the full set of built-in tool
+#      names we've reviewed.  Update this list whenever the SDK
+#      ships a new tool -- otherwise the SDK may expose a tool the
+#      host hasn't audited.
+#   2. ``_ALLOWED_SDK_BUILTIN_TOOLS`` is the *empty* set by default:
+#      no SDK built-in tool is presumed safe.  Adding an entry here
+#      is a deliberate security decision and must be paired with a
+#      review of what the tool actually does in a tenant context.
+#   3. ``_EXCLUDED_BUILTIN_TOOLS`` is mechanically derived as
+#      ``_KNOWN_SDK_BUILTIN_TOOLS - _ALLOWED_SDK_BUILTIN_TOOLS`` and
+#      passed verbatim to the SDK's ``excluded_tools`` kwarg.
+#
+# Defense in depth: ``_TOOL_RESTRICTION_PREFIX`` below also instructs
+# the LLM to never claim or invoke tools outside its declared
+# function schema, so even if a built-in tool slips past the SDK
+# gate the model is primed to refuse.
+_KNOWN_SDK_BUILTIN_TOOLS: frozenset[str] = frozenset({
+    # Shell access -- never appropriate in a tenant agent process.
     "bash", "read_bash", "write_bash", "stop_bash", "list_bash",
-    # Built-in file tools (we provide our own scoped implementations)
+    # Built-in file tools -- we provide our own scoped implementations
+    # via the Hyperlight sandbox (/input, /output).
     "create", "edit", "glob",
-    # Built-in SQL (conflicts with connector SQL tools)
+    # Built-in SQL -- conflicts with connector SQL tools and would
+    # need its own connection-string hygiene.
     "sql",
-    # Sub-agents
+    # Sub-agents -- arbitrary recursive agent spawn.
     "task", "read_agent", "list_agents",
-    # Web fetching (use MCP or execute_python instead)
+    # Web fetching -- unrestricted egress; use MCP or execute_python
+    # (which is gated by the per-agent ``allowed_domains`` policy).
     "web_fetch",
-    # Not needed
+    # Misc tools we've evaluated and decided we don't want.
     "report_intent", "store_memory", "fetch_copilot_cli_documentation",
-]
+})
+
+# Empty by default: every known built-in is denied.  Add a name here
+# only after a security review of how the tool behaves in this host.
+_ALLOWED_SDK_BUILTIN_TOOLS: frozenset[str] = frozenset()
+
+# Derived: pass to ``excluded_tools`` in the SDK kwargs.  Sorted so
+# deployment diffs are stable.
+_EXCLUDED_BUILTIN_TOOLS: List[str] = sorted(
+    _KNOWN_SDK_BUILTIN_TOOLS - _ALLOWED_SDK_BUILTIN_TOOLS
+)
 
 _TOOL_RESTRICTION_PREFIX = (
     "IMPORTANT: Your capabilities are entirely defined by the tools in your"
@@ -100,9 +169,12 @@ def _build_base_kwargs(
     extra_tools: Optional[list] = None,
 ) -> Dict[str, Any]:
     """Build kwargs shared by both session creation and resume."""
-    all_tools = list(_REGISTERED_TOOLS_CACHE)
-    if extra_tools:
-        all_tools.extend(extra_tools)
+    # The old host-side ``tools/`` loader is gone (every custom tool now
+    # runs inside the Hyperlight sandbox -- see :mod:`custom_tools`).
+    # ``extra_tools`` is the only baseline the runner contributes; the
+    # per-agent sandbox + Copilot tools are layered on top by the
+    # caller via the Copilot SDK's own machinery.
+    all_tools = list(extra_tools) if extra_tools else []
 
     system_content = _TOOL_RESTRICTION_PREFIX + _AGENTS_MD_CONTENT_CACHE
 
@@ -211,7 +283,7 @@ async def run_copilot_agent(
         logging.info(f"Resuming existing session: {session_id}")
         resume_kwargs = _build_resume_kwargs(model=model, extra_tools=extra_tools)
         try:
-            session = await client.resume_session(session_id, **resume_kwargs)
+            session = await _call_sdk(client.resume_session(session_id, **resume_kwargs))
             logging.info(f"Successfully resumed session: {session_id}")
         except Exception as e:
             logging.error(f"Failed to resume session '{session_id}': {e}", exc_info=True)
@@ -222,7 +294,7 @@ async def run_copilot_agent(
         session_kwargs = _build_session_kwargs(
             model=model, session_id=session_id, extra_tools=extra_tools
         )
-        session = await client.create_session(**session_kwargs)
+        session = await _call_sdk(client.create_session(**session_kwargs))
         logging.info(f"Created new session: {session.session_id}")
         await _disable_non_project_skills(session)
 
@@ -256,7 +328,7 @@ async def run_copilot_agent(
     session.on(on_event)
 
     try:
-        await session.send_and_wait(prompt, timeout=timeout)
+        await _call_sdk(session.send_and_wait(prompt, timeout=timeout))
 
         return AgentResult(
             session_id=session.session_id,
@@ -359,7 +431,7 @@ async def run_copilot_agent_stream(
         logging.info(f"[stream] Resuming existing session: {session_id}")
         resume_kwargs = _build_resume_kwargs(model=model, streaming=True, extra_tools=extra_tools)
         try:
-            session = await client.resume_session(session_id, **resume_kwargs, on_event=on_event)
+            session = await _call_sdk(client.resume_session(session_id, **resume_kwargs, on_event=on_event))
             logging.info(f"[stream] Successfully resumed session: {session_id}")
         except Exception as e:
             logging.error(f"[stream] Failed to resume session '{session_id}': {e}", exc_info=True)
@@ -370,7 +442,7 @@ async def run_copilot_agent_stream(
         session_kwargs = _build_session_kwargs(
             model=model, session_id=session_id, streaming=True, extra_tools=extra_tools
         )
-        session = await client.create_session(**session_kwargs, on_event=on_event)
+        session = await _call_sdk(client.create_session(**session_kwargs, on_event=on_event))
         logging.info(f"[stream] Created new session: {session.session_id}")
         await _disable_non_project_skills(session)
 
@@ -378,7 +450,7 @@ async def run_copilot_agent_stream(
     yield f"data: {json.dumps({'type': 'session', 'session_id': session.session_id})}\n\n"
 
     # Send the prompt, events arrive via on_event callback
-    await session.send(prompt)
+    await _call_sdk(session.send(prompt))
 
     # Drain the queue until session.idle sentinel arrives or timeout
     try:

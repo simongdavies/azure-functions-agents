@@ -11,7 +11,7 @@ A timer-triggered agent that fetches the day's top tech news headlines, summariz
 - **Timer trigger** — runs daily at 15:00 UTC
 - **Code execution** — uses ACA Dynamic Sessions to fetch tech news from public RSS feeds and Hacker News
 - **Office 365 connector** — sends the email via an Azure API Connection
-- **Variable substitution** — recipient email address configured via `$TO_EMAIL` environment variable, resolved at load time in the agent instructions
+- **Variable substitution** — recipient email address configured via `$AGENT_TO_EMAIL` environment variable, resolved at load time in the agent instructions
 
 ## Prerequisites
 
@@ -28,7 +28,7 @@ A timer-triggered agent that fetches the day's top tech news headlines, summariz
    cd samples/daily-tech-news-email
    azd init
    azd env set GITHUB_TOKEN <your-github-pat>
-   azd env set TO_EMAIL <recipient@example.com>
+   azd env set AGENT_TO_EMAIL <recipient@example.com>
    ```
 
    Optional:
@@ -80,17 +80,24 @@ Required:
 
 - `GITHUB_TOKEN` (see shared guide)
 - `ACA_SESSION_POOL_ENDPOINT`: needed for code execution (fetching news)
-- `TO_EMAIL`: recipient email address
-- `O365_CONNECTION_ID`: Office 365 connector ID
+- `AGENT_TO_EMAIL`: recipient email address
+- `AGENT_O365_CONNECTION_ID`: Office 365 connector ID
 
 Without `ACA_SESSION_POOL_ENDPOINT`:
 
 - The timer still fires, but the agent cannot fetch news (execute_python unavailable)
 - Email sending may fail due to missing connector tools
 
-Without `O365_CONNECTION_ID`:
+Without `AGENT_O365_CONNECTION_ID`:
 
 - The agent cannot send email
+
+> **Note** — env vars referenced from developer-supplied content (agent.md
+> frontmatter and body text) must start with the framework-baked prefix
+> `AGENT_`.  Any name without that prefix is silently ignored at
+> substitution time, so e.g. `$IDENTITY_HEADER` or `$GITHUB_TOKEN` in your
+> prompt body never leaks the host's secrets into the LLM context.  See
+> the [security model](../../README.md#security-model) for the rationale.
 
 ### Testing locally
 
@@ -123,4 +130,4 @@ Invoke-WebRequest -Uri "http://localhost:7071/admin/functions/daily_tech_news_ag
   1. Uses `execute_python` to fetch tech news from public RSS feeds and Hacker News
   2. Summarizes the top stories into an HTML email
   3. Calls the Office 365 send email tool to deliver the summary to the configured recipient
-- The `$TO_EMAIL` variable in the agent instructions is replaced with the actual email address at load time (via environment variable substitution)
+- The `$AGENT_TO_EMAIL` variable in the agent instructions is replaced with the actual email address at load time (via environment variable substitution)

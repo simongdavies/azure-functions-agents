@@ -101,8 +101,8 @@ module api './app/api.bicep' = {
       COPILOT_MODEL: copilotModel
       AZURE_CLIENT_ID: apiUserAssignedIdentity.outputs.clientId
       ACA_SESSION_POOL_ENDPOINT: sessionPool.outputs.poolManagementEndpoint
-      TO_EMAIL: toEmail
-      O365_CONNECTION_ID: office365Connection.outputs.connectionId
+      AGENT_TO_EMAIL: toEmail
+      AGENT_O365_CONNECTION_ID: office365Connection.outputs.connectionId
       ENABLE_MULTIPLATFORM_BUILD: 'true'
       PYTHON_ENABLE_INIT_INDEXING: '1'
     }

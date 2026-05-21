@@ -15,27 +15,32 @@ except ImportError:
     from copilot.session import MCPServerConfig
 
 from .config import get_app_root
+from .mcp_validation import ALLOWED_REMOTE_TYPES, reject_local_stdio_mcp
 
 _MCP_SERVERS_CACHE: Optional[Dict[str, MCPServerConfig]] = None
 
 
 def _parse_mcp_server_config(server: Dict[str, Any]) -> Optional[MCPServerConfig]:
+    """Parse one ``mcp.json`` server entry, rejecting local stdio variants.
+
+    The security gate (which rejects local / stdio configs) lives in
+    :mod:`.mcp_validation` so it can be unit-tested without loading
+    the Copilot SDK.  See that module's docstring for the threat-model
+    rationale.
+
+    Raises :class:`ValueError` on local / stdio configs.  Returns
+    ``None`` for entries that are recognisably remote but missing
+    the ``url`` field (legacy behaviour preserved so a single
+    broken entry doesn't kill startup -- the next entry still
+    loads).
+    """
+    reject_local_stdio_mcp(server)
+
     server_type = str(server.get("type", "")).lower()
-
-    if "command" in server or server_type == "local":
-        local_config: MCPLocalServerConfig = {
-            "type": "local",
-            "command": str(server.get("command", "")),
-            "args": server.get("args", []),
-            "env": server.get("env", {}),
-            "tools": server.get("tools", ["*"]),
-        }
-        if not local_config["command"]:
-            return None
-        return local_config
-
-    if "url" in server or server_type in {"http", "sse"}:
-        remote_type = server_type if server_type in {"http", "sse"} else "http"
+    if "url" in server or server_type in ALLOWED_REMOTE_TYPES:
+        remote_type = (
+            server_type if server_type in ALLOWED_REMOTE_TYPES else "http"
+        )
         remote_config: MCPRemoteServerConfig = {
             "type": remote_type,  # type: ignore
             "url": str(server.get("url", "")),

@@ -102,9 +102,9 @@ module api './app/api.bicep' = {
       GITHUB_TOKEN: githubToken
       COPILOT_MODEL: copilotModel
       AZURE_CLIENT_ID: apiUserAssignedIdentity.outputs.clientId
-      TO_EMAIL: toEmail
-      SUBSCRIPTION_ID: subscription().subscriptionId
-      O365_CONNECTION_ID: office365Connection.outputs.connectionId
+      AGENT_TO_EMAIL: toEmail
+      AGENT_SUBSCRIPTION_ID: subscription().subscriptionId
+      AGENT_O365_CONNECTION_ID: office365Connection.outputs.connectionId
       ENABLE_MULTIPLATFORM_BUILD: 'true'
       PYTHON_ENABLE_INIT_INDEXING: '1'
     }

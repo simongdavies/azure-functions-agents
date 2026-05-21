@@ -270,7 +270,7 @@ def _fetch_token(resource: str) -> _CachedToken:
 def _expires_at_epoch(payload: Mapping[str, object], now: int) -> int:
     """Compute the token expiry epoch from a managed-identity payload.
 
-    Strategy α: prefer ``expires_on`` parsed as an integer epoch.
+    Strategy prefer ``expires_on`` parsed as an integer epoch.
     If that fails -- some App Service responses return a US-locale
     datetime string we deliberately don't parse -- fall back to
     ``now + _DEFAULT_TOKEN_TTL_SECONDS``.  Sub-real TTLs are

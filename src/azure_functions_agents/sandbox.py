@@ -25,8 +25,7 @@ import os
 import re
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
-from urllib.parse import urlparse
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from copilot import define_tool
 from copilot.tools import Tool, ToolInvocation, ToolResult
@@ -41,7 +40,10 @@ from .config import (
 )
 from .credentials import (
     CredentialResolveError,
+    KIND_AZURE_IMDS,
     ParsedSource,
+    check_imds_audience_target,
+    extract_host,
     parse_source,
     resolve as resolve_credential,
     validate_id as validate_credential_id,
@@ -56,6 +58,12 @@ from .file_tools import (
     parse_snippet_result,
     translate_to_guest_path,
 )
+from .custom_tools import (
+    CustomToolSpec,
+    CustomToolset,
+    build_dispatch_snippet,
+)
+from .untrusted import wrap_untrusted_tool_result
 
 # ---------------------------------------------------------------------------
 # Filesystem mounts
@@ -78,6 +86,59 @@ from .file_tools import (
 # via ``filesystem: read_write``.
 _FILESYSTEM_MODE_READ_ONLY = "read_only"
 _FILESYSTEM_MODE_READ_WRITE = "read_write"
+
+
+# ---------------------------------------------------------------------------
+# Sandbox poison recovery
+#
+# A Python-level exception from ``Sandbox.run()`` means the guest VM is
+# dead -- in-guest Python errors arrive as ``result.exit_code != 0``,
+# never as exceptions.  Causes we've actually observed: oversized
+# host->guest IPC payload (single response body wider than the shared
+# memory window between host and guest), guest OOM, guest panic.
+#
+# Recovery strategy (transparent to the caller / LLM):
+#
+#   1. The cached ``Sandbox`` is evicted -- it is unrecoverable.
+#   2. A fresh sandbox is built with the same configuration (allowed
+#      domains, credentials, custom-tool bootstrap, filesystem mounts).
+#   3. The SAME failing payload is retried exactly once on the new
+#      sandbox -- bounded by ``_SANDBOX_RECOVERY_RETRIES`` to avoid an
+#      infinite crash loop on a deterministically poisoning payload.
+#   4. If the retry also crashes (deterministic failure), we surface a
+#      generic ``SandboxExecutionError`` -- no "please retry" hint, no
+#      mention of the underlying poison.  The LLM sees a flat tool
+#      failure, the user sees "I couldn't do that".
+#
+# Session-scoped guest globals are necessarily lost across the reset.
+# Files in the bind-mounted ``/output`` directory persist because that
+# directory is owned by the host, not the sandbox (see user memory:
+# "hyperlight-sandbox.md / Filesystem persistence").
+# ---------------------------------------------------------------------------
+
+# Maximum number of silent reconstruct-and-retry attempts after a guest
+# crash, per request.  ``1`` means: try once on the original sandbox; if
+# it crashes, rebuild and try ONE more time; if that crashes too, give
+# up.  Bounded so a deterministically poisoning payload cannot DoS the
+# worker thread by triggering an infinite rebuild loop.
+_SANDBOX_RECOVERY_RETRIES = 1
+
+
+class SandboxExecutionError(RuntimeError):
+    """Raised after sandbox auto-recovery has been exhausted.
+
+    The worker evicts the poisoned sandbox, rebuilds a fresh one, and
+    retries the failing payload up to ``_SANDBOX_RECOVERY_RETRIES``
+    times.  This exception is raised only when every retry has also
+    crashed -- i.e. the failure looks deterministic for this payload.
+
+    The message embeds the underlying exception (``type(cause).__name__``
+    + ``str(cause)``) so the diagnostic signal survives the wrap-and-
+    re-raise -- without that, the tool-result formatter would only see
+    a useless "Sandbox execution failed." string and the original cause
+    (e.g. a hyperlight guest panic) would be invisible to both the LLM
+    and operators reading logs.
+    """
 
 _FILESYSTEM_VALID_MODES = {
     _FILESYSTEM_MODE_READ_ONLY,
@@ -142,7 +203,7 @@ _FILESYSTEM_DESCRIPTION_READ_ONLY = (
     "Filesystem access:\n"
     "- '/input' is a read-only directory containing files provided by the"
     " host. Use it to load datasets, configuration, or any other files"
-    " supplied by the operator.\n"
+    " supplied by the developer.\n"
     "- '/input/tmp/' is where the Copilot CLI parks large tool outputs to"
     " keep them out of the model context. The CLI reports these on the"
     " host as '{host_tmp}/<file>'. Inside this sandbox the same files"
@@ -171,7 +232,7 @@ _FILESYSTEM_DESCRIPTION_READ_WRITE = (
     " you need to compute over the data.\n"
     "- '/output' is a writable directory backed by a real host directory."
     " Files you create there persist across calls, across turns within a"
-    " conversation, and (when the operator bind-mounts the directory)"
+    " conversation, and (when the developer bind-mounts the directory)"
     " across container restarts.\n"
     "- Example: ``with open('/output/result.json', 'w') as f:"
     " json.dump(data, f)``\n"
@@ -187,7 +248,7 @@ def _build_tool_description(filesystem_mode: str) -> str:
 
     The filesystem section embeds the *current* host-side path for the
     CLI temp directory so the model is told the real on-disk location
-    even when the operator has overridden ``AGENT_INPUT_DIR``.
+    even when the developer has overridden ``AGENT_INPUT_DIR``.
     """
     host_tmp = get_agent_input_tmp_dir()
     if filesystem_mode == _FILESYSTEM_MODE_READ_WRITE:
@@ -437,20 +498,6 @@ class _CredentialSpec:
     prefix: str
 
 
-def _extract_host(target: str) -> str:
-    """Return the bare hostname from a target URL or hostname-only string.
-
-    The host is the key we cross-check against the allow_domain set so a
-    ``credentials.target`` can never reach a destination the
-    allowed_domains list does not also permit (defence-in-depth on top
-    of the guest's own scoping).
-    """
-    if "://" in target:
-        parsed = urlparse(target)
-        return (parsed.hostname or "").lower()
-    return target.split("/", 1)[0].lower()
-
-
 def _normalize_credential_target(target: str) -> str:
     """Normalize a credential ``target`` to a URL-prefix string.
 
@@ -525,7 +572,7 @@ def _parse_credentials(
                 f"credentials[{cred_id}]: missing or empty 'target'"
             )
         target_stripped = target.strip()
-        target_host = _extract_host(target_stripped)
+        target_host = extract_host(target_stripped)
         if not target_host:
             raise ValueError(
                 f"credentials[{cred_id}]: target {target!r} has no host"
@@ -547,10 +594,27 @@ def _parse_credentials(
                 f"credentials[{cred_id}]: 'resource' must be a string"
                 f" when present, got {type(resource).__name__}"
             )
-        if parsed_source.kind == "azure_imds" and not resource:
+        if parsed_source.kind == KIND_AZURE_IMDS and not resource:
             raise ValueError(
                 f"credentials[{cred_id}]: 'resource' is required when"
                 " source is 'azure_imds'"
+            )
+
+        # MSI audience / target cross-check.
+        #
+        # Delegated to :func:`check_imds_audience_target` (lives in
+        # ``credentials/`` so it is unit-testable without loading the
+        # heavy ``copilot`` / ``hyperlight_sandbox`` imports the rest
+        # of this module pulls in).  See the helper's docstring for
+        # the threat-model rationale.
+        if parsed_source.kind == KIND_AZURE_IMDS:
+            # ``resource`` is non-None here (the check above raises
+            # otherwise); the cast is for the type checker.
+            assert resource is not None  # noqa: S101 - parse-time invariant
+            check_imds_audience_target(
+                cred_id=cred_id,
+                resource=resource,
+                target_host=target_host,
             )
 
         header = entry.get("header", _CREDENTIAL_DEFAULT_HEADER)
@@ -602,7 +666,7 @@ def _allowed_domain_hosts(
         if url.startswith("$") or url.startswith("%"):
             # Env-var reference -- resolved later by ``resolve_env_var``.
             continue
-        host = _extract_host(url)
+        host = extract_host(url)
         if host:
             hosts.add(host)
     return hosts
@@ -623,18 +687,227 @@ import queue
 # Sentinel to shut down the worker thread.
 _SHUTDOWN = object()
 
-# Request queue: each item is either _SHUTDOWN or a tuple of
-# (session_id, code, allowed_domains, heap_size, stack_size,
-#  filesystem_mode, credentials, Future).
+# Request queue: each item is either ``_SHUTDOWN``, a per-session
+# session request (9-tuple shape below), or a :class:`_DiscoveryRequest`
+# for the one-shot discovery sandbox path.
+#
+# Session-request tuple:
+#   (session_id, code, allowed_domains, heap_size, stack_size,
+#    filesystem_mode, credentials, custom_bootstrap, Future)
+#
+# ``custom_bootstrap`` is the concatenated source of every developer
+# tool file accepted for this agent.  The worker runs it exactly once
+# per (agent, session) pair -- right after the warmup ``run("None")``
+# and before the first user-triggered call -- so the developer's tool
+# function names land in the guest's global namespace.  Subsequent
+# dispatch snippets (built by :func:`custom_tools.build_dispatch_snippet`)
+# call those functions directly.  The empty string disables the
+# bootstrap step, which is the common case for agents that ship no
+# custom tools.
 _request_queue: queue.Queue = queue.Queue()
 
 # Maximum code payload size (10 MiB) — defence-in-depth matching
 # hyperlight's own limit.
 _MAX_CODE_SIZE = 10 * 1024 * 1024
 
+# Default hard cap for one-shot discovery sandbox runs.  Discovery
+# happens at agent registration (startup) so a generous timeout is
+# fine -- but a runaway snippet must not hang Functions startup
+# forever.  Tuned to cover the slow first-launch path on small SKUs;
+# routine runs complete in well under a second.
+_DEFAULT_DISCOVERY_TIMEOUT_SECS = 30.0
+
 # Whether the worker thread has been started.
 _worker_started = False
 _worker_start_lock = threading.Lock()
+
+
+@dataclass
+class _DiscoveryRequest:
+    """A one-shot ephemeral-sandbox run for custom-tool discovery.
+
+    Routed through the same worker thread as session requests because
+    Hyperlight ``Sandbox`` instances are ``!Send`` and the worker is
+    the single thread allowed to own them.  Each discovery request
+    spins up its own fresh sandbox (no domains, no credentials, no
+    filesystem mounts) and disposes of it before the worker takes
+    the next item -- discovery sandboxes are NEVER cached.
+    """
+
+    snippet: str
+    fut: "concurrent.futures.Future[str]"
+
+
+def _build_session_sandbox(
+    session_id: str,
+    allowed_domains: List[Dict[str, Any]],
+    heap_size: Optional[str],
+    stack_size: Optional[str],
+    filesystem_mode: str,
+    credentials: List[Any],
+    custom_bootstrap: str,
+) -> Sandbox:
+    """Construct + fully bootstrap a per-session ``Sandbox``.
+
+    Extracted from the worker loop so the cold-cache path and the
+    auto-recovery path (post-crash rebuild) share the same construction
+    contract.  Must be called from the sandbox worker thread because
+    ``Sandbox`` is ``!Send``.
+
+    Builds and returns a sandbox with:
+
+    * the requested heap / stack overrides (omitted when ``None`` so
+      the upstream SDK defaults apply);
+    * ``/input`` and (when ``filesystem_mode == 'read_write'``)
+      ``/output`` mounts wired to the configured host directories,
+      silently skipped with a warning when the host directory is
+      missing;
+    * each ``allowed_domains`` entry applied via ``allow_domain``;
+    * each credential applied via ``register_credential`` with a
+      per-spec resolver closure that defers token resolution until the
+      first credentialed HTTP call (so IMDS rotation is picked up
+      within the cache TTL, and the literal token never crosses the
+      host -> guest boundary as guest-runnable bytes);
+    * a warmup ``run("None")`` to trigger first-call init;
+    * the developer-supplied ``custom_bootstrap`` snippet, when
+      non-empty -- a non-zero ``exit_code`` here is fatal (raises
+      ``RuntimeError``) because subsequent dispatch snippets would
+      reference functions the bootstrap failed to define.
+
+    Caller is responsible for caching the returned sandbox under the
+    session id; this helper does not touch any shared state.
+    """
+    kwargs: Dict[str, Any] = {
+        "backend": "wasm",
+        "module": "python_guest.path",
+    }
+    if heap_size:
+        kwargs["heap_size"] = heap_size
+    if stack_size:
+        kwargs["stack_size"] = stack_size
+
+    # Filesystem mounts.  Hyperlight always exposes the guest paths
+    # /input and /output; we wire those to host-side paths from
+    # AGENT_INPUT_DIR / AGENT_OUTPUT_DIR (defaults /sandbox/in and
+    # /sandbox/out -- see config.py).  The frontmatter expresses
+    # INTENT; the host environment decides what's actually available.
+    # On hosts that don't provide the mount points we log a warning
+    # and silently skip the mount so the sandbox can still be
+    # constructed and used for non-FS work.
+    host_input_dir = get_agent_input_dir()
+    host_output_dir = get_agent_output_dir()
+    if os.path.isdir(host_input_dir):
+        kwargs["input_dir"] = host_input_dir
+    else:
+        logging.warning(
+            "execution_sandbox: host directory %s is missing;"
+            " /input will not be available inside the sandbox."
+            " If you intended to expose host files to the guest,"
+            " create the directory (and bind-mount real content into"
+            " it) before starting the function app, or set"
+            " AGENT_INPUT_DIR to an existing path.",
+            host_input_dir,
+        )
+    if filesystem_mode == _FILESYSTEM_MODE_READ_WRITE:
+        if os.path.isdir(host_output_dir):
+            kwargs["output_dir"] = host_output_dir
+        else:
+            logging.warning(
+                "execution_sandbox: filesystem=read_write was requested"
+                " but host directory %s is missing; /output will not be"
+                " available inside the sandbox. Create (and ideally"
+                " bind-mount) the directory to enable persistent writes,"
+                " or set AGENT_OUTPUT_DIR to an existing path.",
+                host_output_dir,
+            )
+
+    sandbox = Sandbox(**kwargs)
+
+    # Apply network allowlist from agent frontmatter.
+    for entry in allowed_domains:
+        url = entry.get("url", "")
+        if not url:
+            continue
+        url = resolve_env_var(str(url))
+        methods = entry.get("methods")
+        sandbox.allow_domain(url, methods=methods)
+        logging.info(
+            "execution_sandbox: allowed domain %s (methods=%s)",
+            url,
+            methods or "ALL",
+        )
+
+    # Scoped credentials.  The upstream API requires
+    # ``register_credential`` to be called before the first
+    # ``run()``; doing it here -- after ``allow_domain`` and before
+    # the warmup ``run("None")`` -- gives the guest both gates active
+    # by the time any agent code runs.
+    #
+    # The resolver is a **callable** (not a literal token): the fork
+    # invokes it on every credentialed outgoing request, so IMDS-token
+    # rotation, env-var changes, and transient IMDS outages are handled
+    # at request time, not session-boot time.  Token caching (5-min
+    # refresh window) lives inside :mod:`credentials.azure_imds`, so we
+    # are not hammering IMDS per request -- but we ARE picking up
+    # rotated tokens within the cache TTL.
+    #
+    # The literal token never crosses the host -> guest boundary as
+    # guest-runnable bytes: it is produced on the host inside this
+    # closure and handed to the WIT ``resolver`` -- the guest only ever
+    # references the credential by *id* (threat-model P1).
+    #
+    # Default-argument capture (``ps=...``, ``r=...``) is required to
+    # bind each iteration's spec into the closure -- otherwise every
+    # closure would close over the loop variable and resolve the last
+    # spec only.
+    for spec in credentials:
+        def _resolver(
+            ps: ParsedSource = spec.parsed_source,
+            r: Optional[str] = spec.resource,
+        ) -> str:
+            return resolve_credential(ps, resource=r)
+
+        sandbox.register_credential(
+            spec.id,
+            target=spec.target,
+            header=spec.header,
+            prefix=spec.prefix,
+            resolver=_resolver,
+        )
+        logging.info(
+            "execution_sandbox: registered credential id=%s"
+            " target=%s header=%s (resolver=callable, token redacted)",
+            spec.id,
+            spec.target,
+            spec.header,
+        )
+
+    # Warm up the sandbox runtime (first run triggers init).
+    sandbox.run("None")
+
+    # Developer-supplied tools (see :mod:`custom_tools`).  The
+    # bootstrap defines every accepted custom function in the guest's
+    # global namespace so the per-call dispatch snippets can invoke
+    # them by name.  Failures here are FATAL for the session: a broken
+    # bootstrap means every subsequent custom-tool call would also
+    # fail, so we raise rather than caching a half-initialised
+    # sandbox.
+    if custom_bootstrap:
+        bootstrap_result = sandbox.run(custom_bootstrap)
+        if bootstrap_result.exit_code != 0:
+            raise RuntimeError(
+                "custom-tool bootstrap failed in session"
+                f" {session_id} (exit_code={bootstrap_result.exit_code});"
+                f" stderr: {bootstrap_result.stderr.strip()!r}"
+            )
+        logging.info(
+            "execution_sandbox: custom-tool bootstrap executed in"
+            " session %s (%d bytes)",
+            session_id,
+            len(custom_bootstrap),
+        )
+
+    return sandbox
 
 
 def _sandbox_worker() -> None:
@@ -651,6 +924,40 @@ def _sandbox_worker() -> None:
         if item is _SHUTDOWN:
             break
 
+        # One-shot ephemeral-sandbox path for custom-tool discovery.
+        # Handled before the session-request unpacking so the two
+        # request shapes stay cleanly separated.  The fresh sandbox
+        # is intentionally NOT cached -- it has no domains, no
+        # credentials, no filesystem mounts, and runs only a single
+        # host-controlled introspection snippet, so reuse would buy
+        # us nothing and cost us blast-radius.
+        if isinstance(item, _DiscoveryRequest):
+            try:
+                discovery_sandbox = Sandbox(
+                    backend="wasm",
+                    module="python_guest.path",
+                )
+                # Warm-up run -- triggers first-call guest init so the
+                # subsequent snippet's stdout starts cleanly.
+                discovery_sandbox.run("None")
+                result = discovery_sandbox.run(item.snippet)
+                if result.exit_code != 0:
+                    item.fut.set_exception(
+                        RuntimeError(
+                            "discovery snippet exited with code"
+                            f" {result.exit_code}; stderr:"
+                            f" {result.stderr.strip()!r}"
+                        )
+                    )
+                else:
+                    item.fut.set_result(result.stdout)
+            except Exception as exc:
+                item.fut.set_exception(exc)
+            # ``discovery_sandbox`` falls out of scope here; the
+            # Rust ``Drop`` impl on the underlying WasmSandbox tears
+            # the VM down.
+            continue
+
         (
             session_id,
             code,
@@ -659,143 +966,132 @@ def _sandbox_worker() -> None:
             stack_size,
             filesystem_mode,
             credentials,
+            custom_bootstrap,
             fut,
         ) = item
         try:
             # Get-or-create sandbox for this session
             if session_id not in sandboxes:
-                kwargs: Dict[str, Any] = {
-                    "backend": "wasm",
-                    "module": "python_guest.path",
-                }
-                if heap_size:
-                    kwargs["heap_size"] = heap_size
-                if stack_size:
-                    kwargs["stack_size"] = stack_size
-
-                # Filesystem mounts.  Hyperlight always exposes the guest
-                # paths /input and /output; we wire those to host-side
-                # paths from AGENT_INPUT_DIR / AGENT_OUTPUT_DIR (defaults
-                # /sandbox/in and /sandbox/out — see config.py).
-                #
-                # The frontmatter expresses INTENT ("I want read_only /
-                # read_write filesystem access"); the host environment
-                # decides what's actually available.  On hosts that don't
-                # provide the mount points (e.g. Azure Functions Linux
-                # consumption plan, dev machines without the basic-chat
-                # container layout, or operators who set AGENT_INPUT_DIR
-                # to a path that doesn't yet exist), we log a warning and
-                # silently skip the mount so the sandbox can still be
-                # constructed and used for non-FS work.
-                host_input_dir = get_agent_input_dir()
-                host_output_dir = get_agent_output_dir()
-                if os.path.isdir(host_input_dir):
-                    kwargs["input_dir"] = host_input_dir
-                else:
-                    logging.warning(
-                        "execution_sandbox: host directory %s is missing;"
-                        " /input will not be available inside the sandbox."
-                        " If you intended to expose host files to the"
-                        " guest, create the directory (and bind-mount real"
-                        " content into it) before starting the function"
-                        " app, or set AGENT_INPUT_DIR to an existing path.",
-                        host_input_dir,
-                    )
-                if filesystem_mode == _FILESYSTEM_MODE_READ_WRITE:
-                    if os.path.isdir(host_output_dir):
-                        kwargs["output_dir"] = host_output_dir
-                    else:
-                        logging.warning(
-                            "execution_sandbox: filesystem=read_write was"
-                            " requested but host directory %s is missing;"
-                            " /output will not be available inside the"
-                            " sandbox. Create (and ideally bind-mount)"
-                            " the directory to enable persistent writes,"
-                            " or set AGENT_OUTPUT_DIR to an existing path.",
-                            host_output_dir,
-                        )
-
-                sandbox = Sandbox(**kwargs)
-
-                # Apply network allowlist from agent frontmatter
-                for entry in allowed_domains:
-                    url = entry.get("url", "")
-                    if not url:
-                        continue
-                    url = resolve_env_var(str(url))
-                    methods = entry.get("methods")
-                    sandbox.allow_domain(url, methods=methods)
-                    logging.info(
-                        "execution_sandbox: allowed domain %s (methods=%s)",
-                        url,
-                        methods or "ALL",
-                    )
-
-                # Scoped credentials.  The upstream API requires
-                # ``register_credential`` to be called before the first
-                # ``run()``; doing it here -- after ``allow_domain`` and
-                # before the warmup ``run("None")`` -- gives the guest
-                # both gates active by the time any agent code runs.
-                #
-                # The resolver is a **callable** (not a literal token):
-                # the fork invokes it on every credentialed outgoing
-                # request, so IMDS-token rotation, env-var changes, and
-                # transient IMDS outages are handled at request time,
-                # not session-boot time.  Token caching (5-min refresh
-                # window) lives inside :mod:`credentials.azure_imds`,
-                # so we are not hammering IMDS per request -- but we
-                # ARE picking up rotated tokens within the cache TTL.
-                #
-                # The literal token never crosses the host -> guest
-                # boundary as guest-runnable bytes: it is produced on
-                # the host inside this closure and handed to the WIT
-                # ``resolver`` -- the guest only ever references the
-                # credential by *id* (threat-model P1).
-                #
-                # Default-argument capture (``ps=...``, ``r=...``) is
-                # required to bind each iteration's spec into the
-                # closure -- otherwise every closure would close over
-                # the loop variable and resolve the last spec only.
-                for spec in credentials:
-                    def _resolver(
-                        ps: ParsedSource = spec.parsed_source,
-                        r: Optional[str] = spec.resource,
-                    ) -> str:
-                        return resolve_credential(ps, resource=r)
-
-                    sandbox.register_credential(
-                        spec.id,
-                        target=spec.target,
-                        header=spec.header,
-                        prefix=spec.prefix,
-                        resolver=_resolver,
-                    )
-                    logging.info(
-                        "execution_sandbox: registered credential id=%s"
-                        " target=%s header=%s (resolver=callable,"
-                        " token redacted)",
-                        spec.id,
-                        spec.target,
-                        spec.header,
-                    )
-
-                # Warm up the sandbox runtime (first run triggers init)
-                sandbox.run("None")
-                sandboxes[session_id] = sandbox
+                sandboxes[session_id] = _build_session_sandbox(
+                    session_id=session_id,
+                    allowed_domains=allowed_domains,
+                    heap_size=heap_size,
+                    stack_size=stack_size,
+                    filesystem_mode=filesystem_mode,
+                    credentials=credentials,
+                    custom_bootstrap=custom_bootstrap,
+                )
                 logging.info(
                     "execution_sandbox: created sandbox for session %s "
                     "(heap=%s, stack=%s, domains=%d, credentials=%d,"
-                    " filesystem=%s)",
+                    " filesystem=%s, custom_bootstrap=%s)",
                     session_id,
                     heap_size or "default",
                     stack_size or "default",
                     len(allowed_domains),
                     len(credentials),
                     filesystem_mode,
+                    "yes" if custom_bootstrap else "no",
                 )
 
-            sandbox = sandboxes[session_id]
-            result = sandbox.run(code)
+            # Cached-sandbox run path with bounded auto-recovery.
+            #
+            # On each iteration we try ``sandbox.run(code)``.  A
+            # Python-level exception means the guest VM is dead (see
+            # the "Sandbox poison recovery" header at the top of this
+            # module).  We evict the dead instance, rebuild a fresh
+            # one with identical config, and retry the SAME payload --
+            # bounded by ``_SANDBOX_RECOVERY_RETRIES`` so a
+            # deterministically poisoning payload cannot trap the
+            # worker thread in an infinite rebuild loop.  Once the
+            # budget is exhausted we surface a generic
+            # ``SandboxExecutionError`` (no retry hint) so the LLM
+            # treats it as a flat tool failure.
+            result = None
+            last_exc: Optional[BaseException] = None
+            # +1 because the first iteration is the initial attempt,
+            # not a retry; ``_SANDBOX_RECOVERY_RETRIES`` counts the
+            # *recovery* attempts that follow it.
+            for attempt in range(_SANDBOX_RECOVERY_RETRIES + 1):
+                sandbox = sandboxes[session_id]
+                try:
+                    result = sandbox.run(code)
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    # Always evict: even if we're about to give up,
+                    # we never want to hand the next request a known-
+                    # dead sandbox.
+                    sandboxes.pop(session_id, None)
+                    if attempt < _SANDBOX_RECOVERY_RETRIES:
+                        logging.warning(
+                            "execution_sandbox: session %s sandbox"
+                            " crashed (attempt %d/%d); evicted and"
+                            " rebuilding for silent retry. Underlying"
+                            " error: %s: %s",
+                            session_id,
+                            attempt + 1,
+                            _SANDBOX_RECOVERY_RETRIES + 1,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        try:
+                            sandboxes[session_id] = _build_session_sandbox(
+                                session_id=session_id,
+                                allowed_domains=allowed_domains,
+                                heap_size=heap_size,
+                                stack_size=stack_size,
+                                filesystem_mode=filesystem_mode,
+                                credentials=credentials,
+                                custom_bootstrap=custom_bootstrap,
+                            )
+                        except Exception as rebuild_exc:
+                            # If even the rebuild fails we have no
+                            # cached entry and no point retrying --
+                            # break out and surface as the final
+                            # failure.
+                            logging.error(
+                                "execution_sandbox: session %s rebuild"
+                                " after crash also failed: %s: %s",
+                                session_id,
+                                type(rebuild_exc).__name__,
+                                rebuild_exc,
+                            )
+                            last_exc = rebuild_exc
+                            break
+                        continue
+                    # Recovery budget exhausted -- fall through.
+                    logging.error(
+                        "execution_sandbox: session %s sandbox crashed"
+                        " on attempt %d/%d; recovery budget exhausted."
+                        " Underlying error: %s: %s",
+                        session_id,
+                        attempt + 1,
+                        _SANDBOX_RECOVERY_RETRIES + 1,
+                        type(exc).__name__,
+                        exc,
+                    )
+
+            if result is None:
+                # All attempts crashed.  Surface the underlying cause
+                # in the exception message so it propagates to the
+                # tool-result wrapper (which stringifies the exception
+                # type + message for the LLM).  Without this, the
+                # original ``last_exc`` lived only on ``__cause__`` and
+                # the LLM saw a useless generic "Sandbox execution
+                # failed." -- erasing the diagnostic signal we need to
+                # tell deterministic poisoning apart from transient
+                # crashes.
+                if last_exc is None:
+                    underlying = "unknown error"
+                else:
+                    underlying = f"{type(last_exc).__name__}: {last_exc}"
+                raise SandboxExecutionError(
+                    f"Sandbox execution failed after"
+                    f" {_SANDBOX_RECOVERY_RETRIES + 1} attempt(s):"
+                    f" {underlying}"
+                ) from last_exc
+
             result_json = json.dumps(
                 {
                     "stdout": result.stdout,
@@ -825,12 +1121,135 @@ def _ensure_worker_started() -> None:
         logging.info("execution_sandbox: worker thread started")
 
 
+def run_discovery_in_sandbox(
+    snippet: str,
+    timeout: Optional[float] = None,
+) -> str:
+    """Run a host-controlled introspection snippet in a fresh sandbox.
+
+    Used at agent registration time by
+    :func:`custom_tools.discover_custom_tools` to introspect
+    developer-supplied tool sources without invoking the host CPython
+    parser on developer bytes (see the threat-model addendum in
+    :mod:`custom_tools`).
+
+    Synchronous (blocks the calling thread) because discovery runs
+    inside Functions worker startup, which is itself a synchronous
+    code path.  The actual Hyperlight VM lives on the existing
+    sandbox worker thread to honour the ``!Send`` constraint.
+
+    Args:
+        snippet: A complete Python program produced by
+            :func:`custom_tools.build_discovery_snippet`.  Must
+            contain only framework-generated code -- developer
+            content is embedded as JSON string literals, not parsed
+            on the host.
+        timeout: Hard cap in seconds, or ``None`` for the default
+            (:data:`_DEFAULT_DISCOVERY_TIMEOUT_SECS`).  On timeout
+            the function raises :class:`concurrent.futures.TimeoutError`
+            and the caller treats the agent as having no custom
+            tools.
+
+    Returns:
+        The snippet's stdout (UTF-8 string), ready to feed into
+        :func:`custom_tools.parse_discovery_output`.
+
+    Raises:
+        RuntimeError: snippet exited non-zero in the guest.
+        concurrent.futures.TimeoutError: snippet exceeded the cap.
+        Exception: any other failure raised by the worker
+            (sandbox construction error, etc.) propagates as-is.
+    """
+    effective_timeout = (
+        timeout if timeout is not None else _DEFAULT_DISCOVERY_TIMEOUT_SECS
+    )
+    _ensure_worker_started()
+    fut: "concurrent.futures.Future[str]" = concurrent.futures.Future()
+    _request_queue.put(_DiscoveryRequest(snippet=snippet, fut=fut))
+    return fut.result(timeout=effective_timeout)
+
+
 # ---------------------------------------------------------------------------
 # Factory: create per-agent execute_python tool
 # ---------------------------------------------------------------------------
 
 
-def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
+def _build_custom_copilot_tool(
+    spec: CustomToolSpec,
+    dispatch: Any,
+) -> Tool:
+    """Wrap one :class:`CustomToolSpec` as a Copilot SDK ``Tool``.
+
+    The handler:
+
+    1. Filters ``invocation.arguments`` down to the developer's declared
+       parameter names (the schema already forbids
+       ``additionalProperties`` so the LLM should not be sending
+       extras, but defence-in-depth costs nothing).
+    2. Builds a dispatch snippet via
+       :func:`custom_tools.build_dispatch_snippet`.
+    3. Runs the snippet through the standard per-session sandbox
+       dispatcher and decodes the result via
+       :func:`file_tools.parse_snippet_result`.
+
+    ``dispatch`` is the closure :func:`create_sandbox_tools` builds
+    around the per-agent settings (allowed domains, credentials, ...).
+    Passing it in keeps this helper a pure function of its spec and
+    avoids leaking the surrounding closure environment.
+    """
+    tool_name = spec.name
+    allowed_keys = set(spec.parameter_names)
+
+    async def _handler(invocation: ToolInvocation) -> ToolResult:
+        raw_args = invocation.arguments or {}
+        filtered = {k: v for k, v in raw_args.items() if k in allowed_keys}
+        snippet = build_dispatch_snippet(spec, filtered)
+        session_id = invocation.session_id or "default"
+        logging.info(
+            "execution_sandbox: custom tool %r invoked in session %s"
+            " (args=%s)",
+            tool_name,
+            session_id,
+            sorted(filtered.keys()),
+        )
+        try:
+            envelope = await dispatch(session_id, snippet)
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            logging.error(
+                "execution_sandbox: custom tool %r dispatch failed"
+                " in session %s: %s",
+                tool_name,
+                session_id,
+                err,
+            )
+            return ToolResult(
+                text_result_for_llm=wrap_untrusted_tool_result(
+                    tool_name, json.dumps({"error": err})
+                ),
+                result_type="failure",
+            )
+
+        ok, payload = parse_snippet_result(envelope)
+        return ToolResult(
+            text_result_for_llm=wrap_untrusted_tool_result(
+                tool_name, json.dumps(payload)
+            ),
+            result_type="success" if ok else "failure",
+        )
+
+    return Tool(
+        name=tool_name,
+        description=spec.description,
+        parameters=spec.parameters_schema,
+        handler=_handler,
+    )
+
+
+def create_sandbox_tools(
+    config: Dict[str, Any],
+    custom_toolset: Optional[CustomToolset] = None,
+) -> List[Tool]:
     """Create an execute_python tool for a specific agent's sandbox config.
 
     Returns a list with one Tool, or an empty list if the config is invalid.
@@ -877,6 +1296,16 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
     to persist data across runs.  Override the container-side paths via
     the ``AGENT_INPUT_DIR`` / ``AGENT_OUTPUT_DIR`` env vars when the
     image uses a different layout.
+
+    Developer-supplied tools:
+
+    When a :class:`CustomToolset` is passed (typically discovered
+    by :func:`custom_tools.discover_custom_tools` at agent
+    registration time), each tool spec becomes its own Copilot SDK
+    tool whose handler dispatches into this same per-session sandbox.
+    The developer's Python source is executed *inside the Hyperlight
+    VM* via a one-shot bootstrap snippet (see ``_sandbox_worker``)
+    -- never on the host.
     """
     raw_allowed_domains = config.get("allowed_domains", [])
     if isinstance(raw_allowed_domains, str):
@@ -899,14 +1328,28 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
         _allowed_domain_hosts(allowed_domains),
     )
 
+    # Developer-supplied tools.  The toolset is discovered upstream
+    # (see :mod:`app`) so this function does not need to know about
+    # filesystem layout; here we only need the bootstrap string and
+    # the per-tool specs.  ``None`` means "no custom tools for this
+    # agent" -- the default for agents that omit ``tools/`` or set
+    # ``execution_sandbox.tools: []``.
+    custom_specs: Tuple[CustomToolSpec, ...] = (
+        custom_toolset.specs if custom_toolset else ()
+    )
+    custom_bootstrap: str = (
+        custom_toolset.bootstrap_code if custom_toolset else ""
+    )
+
     logging.info(
         "execution_sandbox: creating tool (domains=%d, credentials=%d,"
-        " heap=%s, stack=%s, filesystem=%s)",
+        " heap=%s, stack=%s, filesystem=%s, custom_tools=%d)",
         len(allowed_domains),
         len(credentials),
         heap_size or "default",
         stack_size or "default",
         filesystem_mode,
+        len(custom_specs),
     )
 
     async def _dispatch_to_sandbox(session_id: str, code: str) -> str:
@@ -929,6 +1372,7 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
                 stack_size,
                 filesystem_mode,
                 credentials,
+                custom_bootstrap,
                 fut,
             )
         )
@@ -940,7 +1384,9 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
         code = args.get("code", "")
         if not code.strip():
             return ToolResult(
-                text_result_for_llm='{"error": "No code provided"}',
+                text_result_for_llm=wrap_untrusted_tool_result(
+                    "execute_python", '{"error": "No code provided"}'
+                ),
                 result_type="failure",
             )
 
@@ -948,8 +1394,9 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
 
         if len(code.encode("utf-8")) > _MAX_CODE_SIZE:
             return ToolResult(
-                text_result_for_llm=(
-                    '{"error": "Code exceeds maximum size (10 MiB)"}'
+                text_result_for_llm=wrap_untrusted_tool_result(
+                    "execute_python",
+                    '{"error": "Code exceeds maximum size (10 MiB)"}',
                 ),
                 result_type="failure",
             )
@@ -970,7 +1417,10 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
                 session_id,
             )
             return ToolResult(
-                text_result_for_llm=result_json, result_type="success"
+                text_result_for_llm=wrap_untrusted_tool_result(
+                    "execute_python", result_json
+                ),
+                result_type="success",
             )
         except Exception as exc:
             error_msg = f"{type(exc).__name__}: {exc}"
@@ -980,7 +1430,9 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
                 error_msg,
             )
             return ToolResult(
-                text_result_for_llm=json.dumps({"error": error_msg}),
+                text_result_for_llm=wrap_untrusted_tool_result(
+                    "execute_python", json.dumps({"error": error_msg})
+                ),
                 result_type="failure",
             )
 
@@ -1022,7 +1474,9 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
             guest_path = translate_to_guest_path(path)
         except PathTranslationError as exc:
             return ToolResult(
-                text_result_for_llm=json.dumps({"error": str(exc)}),
+                text_result_for_llm=wrap_untrusted_tool_result(
+                    tool_name, json.dumps({"error": str(exc)})
+                ),
                 result_type="failure",
             )
 
@@ -1046,13 +1500,17 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
                 err,
             )
             return ToolResult(
-                text_result_for_llm=json.dumps({"error": err}),
+                text_result_for_llm=wrap_untrusted_tool_result(
+                    tool_name, json.dumps({"error": err})
+                ),
                 result_type="failure",
             )
 
         ok, payload = parse_snippet_result(envelope)
         return ToolResult(
-            text_result_for_llm=json.dumps(payload),
+            text_result_for_llm=wrap_untrusted_tool_result(
+                tool_name, json.dumps(payload)
+            ),
             result_type="success" if ok else "failure",
         )
 
@@ -1172,10 +1630,33 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
         ),
     )(_jq_handler)
 
+    # ---------------------------------------------------------------
+    # Developer-supplied tools (per :mod:`custom_tools`).
+    #
+    # Each :class:`CustomToolSpec` becomes a Copilot SDK tool with
+    # the developer's docstring as the description and the
+    # ast-extracted JSON schema as the parameter contract.  The
+    # handler builds a dispatch snippet via
+    # :func:`build_dispatch_snippet` and runs it against the same
+    # per-session sandbox -- so the developer's Python body executes
+    # *inside the Hyperlight VM* (loaded by the bootstrap step in
+    # ``_sandbox_worker``), not on the host.
+    #
+    # The factory loop captures each ``spec`` via a default-arg
+    # closure to prevent the usual "all closures share the last loop
+    # variable" trap.
+    # ---------------------------------------------------------------
+    custom_tools_list: List[Tool] = []
+    for spec in custom_specs:
+        custom_tools_list.append(
+            _build_custom_copilot_tool(spec, _dispatch_to_sandbox)
+        )
+
     logging.info(
         "execution_sandbox: created %d tools (execute_python + view /"
-        " head / tail / grep / jq)",
-        6,
+        " head / tail / grep / jq + %d custom tool(s))",
+        6 + len(custom_tools_list),
+        len(custom_tools_list),
     )
     return [
         execute_python_tool,
@@ -1184,4 +1665,5 @@ def create_sandbox_tools(config: Dict[str, Any]) -> List[Tool]:
         tail_tool,
         grep_tool,
         jq_tool,
+        *custom_tools_list,
     ]

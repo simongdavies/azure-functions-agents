@@ -9,6 +9,7 @@ from copilot.tools import Tool, ToolInvocation, ToolResult
 
 from .arm import ArmClient, DataPlaneClient
 from .connectors import ConnectionInfo, ParsedOperation, ParsedParameter
+from .untrusted import wrap_untrusted_tool_result
 
 
 def _sanitize_name(name: str) -> str:
@@ -136,7 +137,7 @@ def generate_tools(
             desc_parts.append(f"Connection status: {connection.status}")
         description = " — ".join(desc_parts)
 
-        def make_handler(op=op, connection=connection, all_params=all_params):
+        def make_handler(op=op, connection=connection, all_params=all_params, tool_name=tool_name):
             async def handler(invocation: ToolInvocation) -> ToolResult:
                 args = invocation.arguments or {}
 
@@ -193,7 +194,10 @@ def generate_tools(
                             body=body or None,
                         )
                         return ToolResult(
-                            text_result_for_llm=json.dumps(result, indent=2, default=str),
+                            text_result_for_llm=wrap_untrusted_tool_result(
+                                tool_name,
+                                json.dumps(result, indent=2, default=str),
+                            ),
                             result_type="success",
                         )
                     else:
@@ -240,18 +244,27 @@ def generate_tools(
 
                         if status_code >= 400:
                             return ToolResult(
-                                text_result_for_llm=f"Error ({status_code}): {json.dumps(response_body)}",
+                                text_result_for_llm=wrap_untrusted_tool_result(
+                                    tool_name,
+                                    f"Error ({status_code}): {json.dumps(response_body)}",
+                                ),
                                 result_type="error",
                             )
 
                         return ToolResult(
-                            text_result_for_llm=json.dumps(response_body, indent=2, default=str),
+                            text_result_for_llm=wrap_untrusted_tool_result(
+                                tool_name,
+                                json.dumps(response_body, indent=2, default=str),
+                            ),
                             result_type="success",
                         )
                 except Exception as e:
                     error_type = type(e).__name__
                     return ToolResult(
-                        text_result_for_llm=f"Error invoking {op.operation_id}: {error_type}: {e}",
+                        text_result_for_llm=wrap_untrusted_tool_result(
+                            tool_name,
+                            f"Error invoking {op.operation_id}: {error_type}: {e}",
+                        ),
                         result_type="error",
                     )
 

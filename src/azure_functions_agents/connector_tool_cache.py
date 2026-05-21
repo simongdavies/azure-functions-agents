@@ -8,6 +8,7 @@ from .arm import ArmClient, DataPlaneClient
 from .config import resolve_env_var
 from .connectors import load_connection, is_v2_connection
 from .connector_tools import generate_tools
+from .trigger_validation import validate_connection_id
 
 
 class _ConnectorToolCache:
@@ -72,6 +73,19 @@ class _ConnectorToolCache:
                 connection_id = resolve_env_var(str(raw_connection_id))
                 if not connection_id or connection_id.startswith("%") or connection_id.startswith("$"):
                     logging.warning(f"tools_from_connections: could not resolve connection_id '{raw_connection_id}', skipping")
+                    continue
+
+                # Build-time allow-list gate.  Validate the
+                # resolved ARN shape before passing it to ARM so a
+                # crafted env-var value can't redirect us at an
+                # arbitrary management endpoint.
+                try:
+                    connection_id = validate_connection_id(connection_id)
+                except ValueError as exc:
+                    logging.warning(
+                        f"tools_from_connections: rejected connection_id"
+                        f" '{raw_connection_id}': {exc}"
+                    )
                     continue
 
                 try:
